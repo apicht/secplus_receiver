@@ -22,6 +22,11 @@
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/api/custom_api_device.h"
 #include "esphome/core/automation.h"
+#include "esphome/core/preferences.h"
+
+#include <vector>
+
+#include "remote_store.h"
 
 namespace esphome {
 namespace secplus_receiver {
@@ -38,6 +43,30 @@ class SecplusReceiverComponent
   void set_button_sensor(text_sensor::TextSensor *sensor) { this->button_sensor_ = sensor; }
   void set_fire_event(bool fire) { this->fire_event_ = fire; }
 
+  // ── Authentication (optional) ──────────────────────────────────────────────
+  // Enables the enrolled-remote table with `learn_slots` learnable slots.
+  void set_authentication(uint8_t learn_slots, uint32_t window, uint32_t learn_timeout_ms) {
+    this->auth_enabled_ = true;
+    this->window_ = window;
+    this->learn_timeout_ms_ = learn_timeout_ms;
+    this->store_.init(learn_slots);
+  }
+  // Remote fixed in YAML; must be called after set_authentication().
+  void add_static_remote(uint64_t fixed) { this->store_.add_static(fixed); }
+  // One sensor per learnable slot, in slot order.
+  void add_slot_sensor(text_sensor::TextSensor *sensor) { this->slot_sensors_.push_back(sensor); }
+
+  // Open learn mode: the next remote pressed twice is enrolled. Closes itself
+  // after one remote or after the learn timeout.
+  void start_learn();
+  void stop_learn();
+  bool is_learning() const { return this->store_.learning(); }
+  // Remove the remote in a learnable slot. `slot` is 1-based, as shown in
+  // sensor names, logs and events.
+  void forget(uint8_t slot);
+  void forget_all();
+
+  void setup() override;
   void dump_config() override;
   bool on_receive(remote_base::RemoteReceiveData data) override;
 
@@ -45,6 +74,19 @@ class SecplusReceiverComponent
   void add_on_remote_received_callback(
       std::function<void(uint64_t, uint64_t, uint8_t, uint32_t)> &&callback) {
     this->remote_received_callback_.add(std::move(callback));
+  }
+
+  // (fixed_data, remote_id, button, rolling, slot)
+  void add_on_authenticated_callback(std::function<void(uint64_t, uint64_t, uint8_t, uint32_t, uint8_t)> &&callback) {
+    this->authenticated_callback_.add(std::move(callback));
+  }
+  // (fixed_data, rolling, slot): enrolled remote whose counter was not accepted
+  void add_on_rejected_callback(std::function<void(uint64_t, uint32_t, uint8_t)> &&callback) {
+    this->rejected_callback_.add(std::move(callback));
+  }
+  // (fixed_data, slot)
+  void add_on_remote_learned_callback(std::function<void(uint64_t, uint8_t)> &&callback) {
+    this->remote_learned_callback_.add(std::move(callback));
   }
 
 
@@ -63,6 +105,23 @@ class SecplusReceiverComponent
   uint32_t last_rolling{0};
 
   CallbackManager<void(uint64_t, uint64_t, uint8_t, uint32_t)> remote_received_callback_{};
+  CallbackManager<void(uint64_t, uint64_t, uint8_t, uint32_t, uint8_t)> authenticated_callback_{};
+  CallbackManager<void(uint64_t, uint32_t, uint8_t)> rejected_callback_{};
+  CallbackManager<void(uint64_t, uint8_t)> remote_learned_callback_{};
+
+  // ── Authentication state ───────────────────────────────────────────────────
+  // Handle a packet while learn mode is open.
+  void handle_learn_(uint64_t fixed, uint32_t rolling);
+  // Write one slot to flash immediately and refresh its sensor.
+  void save_slot_(size_t index);
+  void publish_slot_(size_t index);
+
+  bool auth_enabled_{false};
+  uint32_t window_{1024};
+  uint32_t learn_timeout_ms_{30000};
+  RemoteStore store_;
+  std::vector<ESPPreferenceObject> slot_prefs_;
+  std::vector<text_sensor::TextSensor *> slot_sensors_;
 
 
 
@@ -98,8 +157,52 @@ class RemoteReceivedTrigger : public Trigger<uint64_t, uint64_t, uint8_t, uint32
   }
 };
 
+class AuthenticatedTrigger : public Trigger<uint64_t, uint64_t, uint8_t, uint32_t, uint8_t> {
+ public:
+  explicit AuthenticatedTrigger(SecplusReceiverComponent *parent) {
+    parent->add_on_authenticated_callback(
+        [this](uint64_t fixed_data, uint64_t remote_id, uint8_t button, uint32_t rolling, uint8_t slot) {
+          this->trigger(fixed_data, remote_id, button, rolling, slot);
+        });
+  }
+};
 
+class RejectedTrigger : public Trigger<uint64_t, uint32_t, uint8_t> {
+ public:
+  explicit RejectedTrigger(SecplusReceiverComponent *parent) {
+    parent->add_on_rejected_callback(
+        [this](uint64_t fixed_data, uint32_t rolling, uint8_t slot) { this->trigger(fixed_data, rolling, slot); });
+  }
+};
 
+class RemoteLearnedTrigger : public Trigger<uint64_t, uint8_t> {
+ public:
+  explicit RemoteLearnedTrigger(SecplusReceiverComponent *parent) {
+    parent->add_on_remote_learned_callback(
+        [this](uint64_t fixed_data, uint8_t slot) { this->trigger(fixed_data, slot); });
+  }
+};
+
+template<typename... Ts> class LearnAction : public Action<Ts...>, public Parented<SecplusReceiverComponent> {
+ public:
+  void play(const Ts &...x) override { this->parent_->start_learn(); }
+};
+
+template<typename... Ts> class StopLearnAction : public Action<Ts...>, public Parented<SecplusReceiverComponent> {
+ public:
+  void play(const Ts &...x) override { this->parent_->stop_learn(); }
+};
+
+template<typename... Ts> class ForgetAction : public Action<Ts...>, public Parented<SecplusReceiverComponent> {
+ public:
+  TEMPLATABLE_VALUE(uint8_t, slot)
+  void play(const Ts &...x) override { this->parent_->forget(this->slot_.value(x...)); }
+};
+
+template<typename... Ts> class ForgetAllAction : public Action<Ts...>, public Parented<SecplusReceiverComponent> {
+ public:
+  void play(const Ts &...x) override { this->parent_->forget_all(); }
+};
 
 }  // namespace secplus_receiver
 }  // namespace esphome

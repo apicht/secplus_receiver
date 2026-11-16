@@ -146,6 +146,114 @@ secplus_receiver:
 
 ---
 
+## Authentication (optional)
+
+By default every decoded remote is reported, and a recorded transmission can
+simply be replayed. Enabling `authentication` adds an allowlist of enrolled
+remotes and rolling-counter replay protection, the same checks a real opener
+performs.
+
+> **Security limit:** Security+ 2.0 has no secret key. Anyone who captures a
+> single transmission can compute the next valid code, and no receiver can
+> prevent that. Treat this as replay protection, not strong authentication.
+
+```yaml
+secplus_receiver:
+  id: secplus_receiver_id
+  authentication:
+    max_remotes: 8       # learnable slots (0-32), default 8
+    window: 1024         # accepted distance ahead of the stored counter, default 1024
+    learn_timeout: 30s   # how long learn mode stays open, default 30s
+    slot_sensors: true   # create a "Remote Slot N" text sensor per slot, default true
+    remotes:             # optional: fixed codes that are always enrolled
+      - 70678577664
+  on_authenticated:
+    then:
+      - logger.log:
+          format: "Authenticated remote in slot %u, button %u"
+          args: [slot, button]
+```
+
+### How a press is checked
+
+* The fixed code must be enrolled, either learned into a slot or listed under
+  `remotes:`.
+* The rolling code must be 1 to `window` counts ahead of the last accepted
+  code for that remote. Anything else, including a replay, is rejected.
+* The accepted counter is written to flash immediately, so it survives a
+  power cut.
+
+Each button on a remote has its own fixed code and is enrolled separately.
+
+### Learning and forgetting remotes
+
+| Action | Effect |
+|---|---|
+| `secplus_receiver.learn` | Opens learn mode for `learn_timeout`. Press the new remote's button **twice**; it is stored in the first free slot and learn mode closes. |
+| `secplus_receiver.stop_learn` | Closes learn mode early. |
+| `secplus_receiver.forget` | Clears one slot (`slot:` is 1-based and templatable). |
+| `secplus_receiver.forget_all` | Clears every learned slot. |
+
+While learn mode is open no remote authenticates, so enrolling never triggers
+your automations. Pressing an already-enrolled remote twice in learn mode
+moves its stored counter forward, which recovers a remote that was pressed
+more than `window` times out of range.
+
+Expose the actions as Home Assistant entities, or wire `learn` to a GPIO button:
+
+```yaml
+button:
+  - platform: template
+    name: "Learn Remote"
+    on_press:
+      - secplus_receiver.learn: secplus_receiver_id
+  - platform: template
+    name: "Forget All Remotes"
+    on_press:
+      - secplus_receiver.forget_all: secplus_receiver_id
+
+api:
+  actions:
+    - action: forget_remote      # esphome.<device>_forget_remote in Home Assistant
+      variables:
+        slot: int
+      then:
+        - secplus_receiver.forget:
+            id: secplus_receiver_id
+            slot: !lambda "return slot;"
+```
+
+Each "Remote Slot N" sensor shows the fixed code stored in that slot, or
+`empty`. Slots hold codes, not names; map slots to people in your automations.
+Remotes listed under `remotes:` are numbered after the learnable slots, have
+no sensor, and can only be removed by editing the YAML.
+
+Learned remotes survive firmware updates. A full flash erase removes them.
+
+### Triggers and events
+
+| Trigger | Variables |
+|---|---|
+| `on_authenticated` | `fixed_data`, `remote_id`, `button`, `rolling`, `slot` |
+| `on_rejected` | `fixed_data`, `rolling`, `slot` (an enrolled remote sent a code outside the window, for example a replay) |
+| `on_remote_learned` | `fixed_data`, `slot` |
+
+`on_remote_received`, the sensors and the `esphome.secplus_received` event
+still fire for every remote. With authentication enabled the event also
+carries `authenticated` (`true` / `false`) and, when authenticated, `slot`.
+With `fire_homeassistant_event: true`, learning a remote fires
+`esphome.secplus_remote_learned` with `fixed_data` and `slot`.
+
+### Tests
+
+The slot and counter logic has host unit tests:
+
+```
+c++ -std=c++17 -Wall -Wextra -o /tmp/test_remote_store tests/test_remote_store.cpp && /tmp/test_remote_store
+```
+
+---
+
 ## CC1101 frequency
 
 Set the `cc1101:` block's `frequency:` to match your remotes:
@@ -181,6 +289,7 @@ secplus_receiver/
         └── secplus_receiver/
             ├── __init__.py           ← config schema + build-time downloader
             ├── secplus_receiver.h    ← SecplusReceiverComponent C++ class
+            ├── remote_store.h        ← enrolled-remote table (authentication)
             ├── secplus_parser.c      ← Manchester / Security+ 2.0 frame decoder
             ├── secplus_parser.h
             └── secplus_shim.h        ← ManchesterDecoder C++ wrapper

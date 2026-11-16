@@ -146,10 +146,165 @@ static int process_packet(const uint8_t *bits, int nbits, uint8_t *packet, int *
 
 // ── Component ────────────────────────────────────────────────────────────────
 
+// Preference keys. Learn slots are keyed by index so that changing
+// max_remotes keeps the slots that still exist. Static remotes are keyed by
+// their fixed code so reordering the YAML list keeps their counters.
+static const uint32_t SLOT_PREF_BASE = fnv1_hash("secplus_receiver_slot");
+static const uint32_t STATIC_PREF_BASE = fnv1_hash("secplus_receiver_static");
+
+void SecplusReceiverComponent::setup() {
+  if (!this->auth_enabled_) {
+    return;
+  }
+  const size_t n = this->store_.size();
+  this->slot_prefs_.reserve(n);
+  for (size_t i = 0; i < n; i++) {
+    uint32_t key;
+    if (this->store_.is_static(i)) {
+      const uint64_t fixed = this->store_.slot(i).fixed;
+      key = fnv1_hash_extend(STATIC_PREF_BASE, fixed);
+    } else {
+      key = SLOT_PREF_BASE + (uint32_t) i;
+    }
+    this->slot_prefs_.push_back(global_preferences->make_preference<RemoteSlot>(key));
+    RemoteSlot saved;
+    if (this->slot_prefs_[i].load(&saved)) {
+      this->store_.restore(i, saved);
+    }
+    this->publish_slot_(i);
+  }
+}
+
 void SecplusReceiverComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "Security+ 2.0 Receiver:");
   LOG_TEXT_SENSOR("  ", "Remote ID", this->remote_id_sensor_);
   LOG_TEXT_SENSOR("  ", "Rolling Code", this->rolling_code_sensor_);
+  if (!this->auth_enabled_) {
+    ESP_LOGCONFIG(TAG, "  Authentication: disabled");
+    return;
+  }
+  ESP_LOGCONFIG(TAG,
+                "  Authentication: enabled\n"
+                "    Learn slots: %u\n"
+                "    Static remotes: %u\n"
+                "    Counter window: %u\n"
+                "    Learn timeout: %u ms",
+                (unsigned) this->store_.learn_slots(), (unsigned) (this->store_.size() - this->store_.learn_slots()),
+                (unsigned) this->window_, (unsigned) this->learn_timeout_ms_);
+  for (size_t i = 0; i < this->store_.size(); i++) {
+    if (this->store_.occupied(i)) {
+      ESP_LOGCONFIG(TAG, "    Slot %u%s: fixed=%" PRIu64, (unsigned) (i + 1), this->store_.is_static(i) ? " (static)" : "",
+                    this->store_.slot(i).fixed);
+    }
+  }
+}
+
+void SecplusReceiverComponent::publish_slot_(size_t index) {
+  if (index >= this->slot_sensors_.size() || this->slot_sensors_[index] == nullptr) {
+    return;
+  }
+  if (!this->store_.occupied(index)) {
+    this->slot_sensors_[index]->publish_state("empty");
+    return;
+  }
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%" PRIu64, this->store_.slot(index).fixed);
+  this->slot_sensors_[index]->publish_state(buf);
+}
+
+void SecplusReceiverComponent::save_slot_(size_t index) {
+  if (index >= this->slot_prefs_.size()) {
+    return;
+  }
+  RemoteSlot slot = this->store_.slot(index);
+  // Write straight away instead of waiting for flash_write_interval: a counter
+  // lost to a power cut would make recently used codes replayable. Presses
+  // are rare, so the extra flash wear is negligible.
+  if (!this->slot_prefs_[index].save(&slot) || !global_preferences->sync()) {
+    ESP_LOGE(TAG, "Failed to save slot %u to flash", (unsigned) (index + 1));
+  }
+  this->publish_slot_(index);
+}
+
+void SecplusReceiverComponent::start_learn() {
+  if (!this->auth_enabled_) {
+    ESP_LOGW(TAG, "Learn requested, but 'authentication' is not configured");
+    return;
+  }
+  this->store_.start_learn();
+  ESP_LOGI(TAG, "Learn mode open for %u s: press the new remote's button twice",
+           (unsigned) (this->learn_timeout_ms_ / 1000));
+  this->set_timeout("learn", this->learn_timeout_ms_, [this]() {
+    if (this->store_.learning()) {
+      this->store_.stop_learn();
+      ESP_LOGI(TAG, "Learn mode timed out, nothing learned");
+    }
+  });
+}
+
+void SecplusReceiverComponent::stop_learn() {
+  this->cancel_timeout("learn");
+  if (this->store_.learning()) {
+    this->store_.stop_learn();
+    ESP_LOGI(TAG, "Learn mode closed");
+  }
+}
+
+void SecplusReceiverComponent::forget(uint8_t slot) {
+  if (slot < 1 || !this->store_.forget((size_t) slot - 1)) {
+    ESP_LOGW(TAG, "Cannot forget slot %u: not a learned remote", slot);
+    return;
+  }
+  this->save_slot_((size_t) slot - 1);
+  ESP_LOGI(TAG, "Forgot remote in slot %u", slot);
+}
+
+void SecplusReceiverComponent::forget_all() {
+  for (size_t i = 0; i < this->store_.learn_slots(); i++) {
+    if (this->store_.forget(i)) {
+      this->save_slot_(i);
+    }
+  }
+  ESP_LOGI(TAG, "Forgot all learned remotes");
+}
+
+void SecplusReceiverComponent::handle_learn_(uint64_t fixed, uint32_t rolling) {
+  int slot = -1;
+  switch (this->store_.learn(fixed, rolling, &slot)) {
+    case LearnResult::PENDING:
+      ESP_LOGI(TAG, "Learn: heard fixed=%" PRIu64 ", press the same button again to confirm", fixed);
+      break;
+    case LearnResult::LEARNED: {
+      this->cancel_timeout("learn");
+      this->save_slot_(slot);
+      ESP_LOGI(TAG, "Learned remote fixed=%" PRIu64 " into slot %d", fixed, slot + 1);
+      this->remote_learned_callback_.call(fixed, (uint8_t) (slot + 1));
+      if (this->fire_event_) {
+        char buf[24];
+        std::map<std::string, std::string> data;
+        snprintf(buf, sizeof(buf), "%" PRIu64, fixed);
+        data["fixed_data"] = buf;
+        snprintf(buf, sizeof(buf), "%d", slot + 1);
+        data["slot"] = buf;
+        this->fire_homeassistant_event("esphome.secplus_remote_learned", data);
+      }
+      break;
+    }
+    case LearnResult::RESYNCED:
+      this->cancel_timeout("learn");
+      this->save_slot_(slot);
+      ESP_LOGI(TAG, "Remote in slot %d was already enrolled; counter resynchronised", slot + 1);
+      break;
+    case LearnResult::REJECTED:
+      ESP_LOGW(TAG, "Learn: remote in slot %d sent a counter that is not ahead of the stored one, ignored", slot + 1);
+      break;
+    case LearnResult::FULL:
+      this->cancel_timeout("learn");
+      ESP_LOGW(TAG, "Learn failed: all %u slots are in use, forget one first", (unsigned) this->store_.learn_slots());
+      break;
+    case LearnResult::NOT_LEARNING:
+      break;
+  }
 }
 
 bool SecplusReceiverComponent::on_receive(remote_base::RemoteReceiveData data) {
@@ -288,9 +443,42 @@ void SecplusReceiverComponent::publish_(uint32_t rolling, uint64_t fixed, uint32
     this->last_fixed = fixed;
     this->last_rolling = rolling;
 
+    // Authentication: allowlist + rolling-counter replay protection.
+    // While learn mode is open nothing authenticates, so enrolling a remote
+    // never triggers whatever the remote normally controls.
+    bool authenticated = false;
+    int slot = -1;  // 0-based index into the store
+    if (this->auth_enabled_) {
+        if (this->store_.learning()) {
+            this->handle_learn_(fixed, rolling);
+        } else {
+            switch (this->store_.check(fixed, rolling, this->window_, &slot)) {
+                case AuthResult::AUTHENTICATED:
+                    authenticated = true;
+                    this->save_slot_(slot);
+                    ESP_LOGI(TAG, "Authenticated remote in slot %d (rolling=%u)", slot + 1, (unsigned) rolling);
+                    break;
+                case AuthResult::REJECTED:
+                    ESP_LOGW(TAG,
+                             "Rejected remote in slot %d: rolling=%u is not within %u ahead of stored %u "
+                             "(replay, or remote too far ahead; re-learn to resync)",
+                             slot + 1, (unsigned) rolling, (unsigned) this->window_,
+                             (unsigned) this->store_.slot(slot).rolling);
+                    this->rejected_callback_.call(fixed, rolling, (uint8_t) (slot + 1));
+                    break;
+                case AuthResult::UNKNOWN:
+                    break;
+            }
+        }
+    }
+
     // Call the on_remote_received callback
     // TODO: send pincode, too?
     this->remote_received_callback_.call(fixed, remote_id, button, rolling);
+
+    if (authenticated) {
+        this->authenticated_callback_.call(fixed, remote_id, button, rolling, (uint8_t) (slot + 1));
+    }
 
     char buf[24];
     if (this->fixed_data_sensor_ != nullptr) {
@@ -334,6 +522,14 @@ void SecplusReceiverComponent::publish_(uint32_t rolling, uint64_t fixed, uint32
 
         if ( pincode.length() > 0 ) {
             data["pincode"] = pincode.c_str();
+        }
+
+        if (this->auth_enabled_) {
+            data["authenticated"] = authenticated ? "true" : "false";
+            if (authenticated) {
+                snprintf(buf, sizeof(buf), "%d", slot + 1);
+                data["slot"] = buf;
+            }
         }
 
         this->fire_homeassistant_event("esphome.secplus_received", data);
