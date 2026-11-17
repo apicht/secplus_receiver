@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""End-to-end tests for secplus_receiver on ESPHome's native `host` platform.
+
+Compiles tests/host/secplus_host.yaml into an ordinary program, runs it, and
+drives it over the real ESPHome native API the way Home Assistant would:
+pressing buttons, calling actions, and reading sensor states and events.
+Remote presses are injected as genuine Security+ 2.0 pulse trains, so the
+Manchester decoder, authentication, learn mode, and flash persistence are all
+exercised. No ESP32 or radio is needed. The radio itself is NOT tested.
+
+Requirements: Python with `esphome` installed (it brings `aioesphomeapi`) and
+a C++ compiler. Linux or macOS.
+
+    python tests/host/run_host_tests.py            # build, then test
+    python tests/host/run_host_tests.py --no-build # reuse the last build
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+from aioesphomeapi import APIClient
+
+HERE = Path(__file__).resolve().parent
+CONFIG = HERE / "secplus_host.yaml"
+BINARY = HERE / ".esphome/build/secplus-host/.pioenvs/secplus-host/program"
+PORT = 16053  # must match api.port in secplus_host.yaml
+TIMEOUT = 5.0
+LEARN_TIMEOUT = 2.0  # must match learn_timeout in secplus_host.yaml
+WINDOW = 16  # must match window in secplus_host.yaml
+
+REMOTE_A = 70678577664
+REMOTE_B = 62088643072
+STATIC_REMOTE = 123456789  # listed under `remotes:`; slot 3 after the 2 learn slots
+
+
+class Device:
+    """One running instance of the host build plus an API connection to it."""
+
+    def __init__(self, prefdir: str) -> None:
+        self.prefdir = prefdir
+        self.proc: subprocess.Popen | None = None
+        self.client: APIClient | None = None
+        self.states: dict[int, str] = {}
+        self.events: list = []
+        self.keys: dict[str, int] = {}
+        self.services: dict[str, object] = {}
+
+    async def start(self) -> None:
+        env = dict(os.environ, ESPHOME_PREFDIR=self.prefdir)
+        self.proc = subprocess.Popen(
+            [str(BINARY)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        self.states.clear()
+        self.events.clear()
+        deadline = asyncio.get_running_loop().time() + TIMEOUT
+        while True:
+            self.client = APIClient("127.0.0.1", PORT, None)
+            try:
+                await self.client.connect(login=True, log_errors=False)
+                break
+            except Exception:  # noqa: BLE001 - device still starting
+                if self.proc.poll() is not None:
+                    raise RuntimeError("host program exited during startup") from None
+                if asyncio.get_running_loop().time() > deadline:
+                    raise
+                await asyncio.sleep(0.1)
+        entities, services = await self.client.list_entities_services()
+        self.keys = {e.name: e.key for e in entities}
+        self.services = {s.name: s for s in services}
+        self.client.subscribe_states(self._on_state)
+        self.client.subscribe_service_calls(self.events.append)
+
+    def _on_state(self, state) -> None:
+        if hasattr(state, "state"):
+            self.states[state.key] = state.state
+
+    async def stop(self) -> None:
+        if self.client is not None:
+            await self.client.disconnect(force=True)
+            self.client = None
+        if self.proc is not None:
+            self.proc.terminate()
+            self.proc.wait(timeout=TIMEOUT)
+            self.proc = None
+
+    async def restart(self) -> None:
+        await self.stop()
+        await self.start()
+
+    async def wait_for(self, predicate, what: str):
+        deadline = asyncio.get_running_loop().time() + TIMEOUT
+        while True:
+            result = predicate()
+            if result:
+                return result
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError(f"timed out waiting for {what}")
+            await asyncio.sleep(0.02)
+
+    def slot(self, number: int) -> str | None:
+        return self.states.get(self.keys[f"Remote Slot {number}"])
+
+    async def wait_slot(self, number: int, expected: str) -> None:
+        await self.wait_for(
+            lambda: self.slot(number) == expected,
+            f"Remote Slot {number} == {expected!r} (is {self.slot(number)!r})",
+        )
+
+    def push_button(self, name: str) -> None:
+        self.client.button_command(self.keys[name])
+
+    async def forget(self, slot: int) -> None:
+        await self.client.execute_service(self.services["forget_remote"], {"slot": slot})
+
+    async def press(self, fixed: int, rolling: int) -> dict[str, str]:
+        """Simulate a remote press; return the esphome.secplus_received event data."""
+        start = len(self.events)
+        await self.client.execute_service(
+            self.services["press"], {"fixed": str(fixed), "rolling": rolling}
+        )
+
+        def find():
+            for event in self.events[start:]:
+                if (
+                    event.service == "esphome.secplus_received"
+                    and event.data.get("fixed_data") == str(fixed)
+                    and event.data.get("rolling_code") == str(rolling)
+                ):
+                    return event.data
+            return None
+
+        return await self.wait_for(find, f"event for fixed={fixed} rolling={rolling}")
+
+    def learned_events(self) -> list[dict[str, str]]:
+        return [e.data for e in self.events if e.service == "esphome.secplus_remote_learned"]
+
+
+def expect_auth(event: dict[str, str], slot: int | None) -> None:
+    """Assert the event is authenticated for `slot`, or unauthenticated if None."""
+    if slot is None:
+        assert event.get("authenticated") == "false", event
+        assert "slot" not in event, event
+    else:
+        assert event.get("authenticated") == "true", event
+        assert event.get("slot") == str(slot), event
+
+
+async def learn(dev: Device, fixed: int, rolling: int) -> None:
+    """Enrol a remote: open learn mode and press twice."""
+    dev.push_button("Learn Remote")
+    await asyncio.sleep(0.2)
+    expect_auth(await dev.press(fixed, rolling), None)
+    expect_auth(await dev.press(fixed, rolling + 1), None)
+
+
+# ── Scenarios. They run in order against one device and share its state. ─────
+
+
+async def test_boot_state(dev: Device) -> None:
+    await dev.wait_slot(1, "empty")
+    await dev.wait_slot(2, "empty")
+    assert "Remote Slot 3" not in dev.keys  # static remotes get no sensor
+
+
+async def test_decode_and_unknown_remote(dev: Device) -> None:
+    event = await dev.press(REMOTE_A, 100)  # proves the pulse train decodes
+    expect_auth(event, None)
+    await dev.wait_for(
+        lambda: dev.states.get(dev.keys["Fixed Data"]) == str(REMOTE_A), "Fixed Data sensor"
+    )
+    await dev.wait_for(
+        lambda: dev.states.get(dev.keys["Rolling Code"]) == "100", "Rolling Code sensor"
+    )
+
+
+async def test_learn_needs_two_presses(dev: Device) -> None:
+    dev.push_button("Learn Remote")
+    await asyncio.sleep(0.2)
+    expect_auth(await dev.press(REMOTE_A, 101), None)
+    await asyncio.sleep(0.2)
+    assert dev.slot(1) == "empty"  # one press is not enough
+    expect_auth(await dev.press(REMOTE_A, 102), None)  # enrolling never authenticates
+    await dev.wait_slot(1, str(REMOTE_A))
+    learned = await dev.wait_for(dev.learned_events, "learned event")
+    assert learned[-1] == {"fixed_data": str(REMOTE_A), "slot": "1"}, learned
+
+
+async def test_authenticates_and_rejects_replay(dev: Device) -> None:
+    expect_auth(await dev.press(REMOTE_A, 103), 1)
+    expect_auth(await dev.press(REMOTE_B, 500), None)  # unknown remote in between
+    expect_auth(await dev.press(REMOTE_A, 103), None)  # replay of an accepted code
+    expect_auth(await dev.press(REMOTE_A, 101), None)  # replay of an older code
+
+
+async def test_counter_window(dev: Device) -> None:
+    expect_auth(await dev.press(REMOTE_A, 103 + WINDOW), 1)  # edge of the window
+    last = 103 + WINDOW
+    expect_auth(await dev.press(REMOTE_A, last + WINDOW + 1), None)  # just beyond it
+    expect_auth(await dev.press(REMOTE_A, last + 1), 1)  # counter was not disturbed
+
+
+async def test_static_remote(dev: Device) -> None:
+    expect_auth(await dev.press(STATIC_REMOTE, 7), 3)  # first use is trusted
+    expect_auth(await dev.press(REMOTE_B, 501), None)
+    expect_auth(await dev.press(STATIC_REMOTE, 7), None)
+    expect_auth(await dev.press(STATIC_REMOTE, 8), 3)
+    await dev.forget(3)  # static remotes cannot be forgotten
+    expect_auth(await dev.press(STATIC_REMOTE, 9), 3)
+
+
+async def test_learn_mode_times_out(dev: Device) -> None:
+    dev.push_button("Learn Remote")
+    await asyncio.sleep(0.2)
+    expect_auth(await dev.press(REMOTE_B, 600), None)
+    await asyncio.sleep(LEARN_TIMEOUT + 0.5)
+    expect_auth(await dev.press(REMOTE_B, 601), None)
+    await asyncio.sleep(0.2)
+    assert dev.slot(2) == "empty"
+
+
+async def test_learn_mode_suppresses_authentication(dev: Device) -> None:
+    dev.push_button("Learn Remote")
+    await asyncio.sleep(0.2)
+    expect_auth(await dev.press(REMOTE_A, 121), None)  # enrolled, but learn mode is open
+    await asyncio.sleep(LEARN_TIMEOUT + 0.5)
+    expect_auth(await dev.press(REMOTE_A, 122), 1)
+
+
+async def test_resync_in_learn_mode(dev: Device) -> None:
+    expect_auth(await dev.press(REMOTE_A, 5000), None)  # far beyond the window
+    await learn(dev, REMOTE_A, 5001)
+    await asyncio.sleep(0.2)
+    assert dev.slot(1) == str(REMOTE_A) and dev.slot(2) == "empty"  # no duplicate slot
+    expect_auth(await dev.press(REMOTE_A, 5003), 1)
+
+
+async def test_survives_restart(dev: Device) -> None:
+    await dev.restart()
+    await dev.wait_slot(1, str(REMOTE_A))
+    expect_auth(await dev.press(REMOTE_A, 5003), None)  # counter persisted: still a replay
+    expect_auth(await dev.press(REMOTE_A, 5004), 1)
+    expect_auth(await dev.press(STATIC_REMOTE, 9), None)  # static counter persisted too
+    expect_auth(await dev.press(STATIC_REMOTE, 10), 3)
+
+
+async def test_forget_slot(dev: Device) -> None:
+    await learn(dev, REMOTE_B, 700)
+    await dev.wait_slot(2, str(REMOTE_B))
+    await dev.forget(1)
+    await dev.wait_slot(1, "empty")
+    expect_auth(await dev.press(REMOTE_A, 5005), None)  # revoked immediately
+    expect_auth(await dev.press(REMOTE_B, 702), 2)  # other slot untouched
+    await dev.restart()
+    await dev.wait_slot(1, "empty")  # still forgotten after a reboot
+    await dev.wait_slot(2, str(REMOTE_B))
+
+
+async def test_slots_full_then_forget_all(dev: Device) -> None:
+    await learn(dev, REMOTE_A, 6000)  # reuses the freed slot 1
+    await dev.wait_slot(1, str(REMOTE_A))
+    await learn(dev, 55555, 10)  # no free slot left
+    await asyncio.sleep(0.2)
+    expect_auth(await dev.press(55555, 12), None)
+
+    dev.push_button("Forget All Remotes")
+    await dev.wait_slot(1, "empty")
+    await dev.wait_slot(2, "empty")
+    expect_auth(await dev.press(REMOTE_A, 6002), None)
+    expect_auth(await dev.press(STATIC_REMOTE, 11), 3)  # static remote remains
+
+
+SCENARIOS = [
+    test_boot_state,
+    test_decode_and_unknown_remote,
+    test_learn_needs_two_presses,
+    test_authenticates_and_rejects_replay,
+    test_counter_window,
+    test_static_remote,
+    test_learn_mode_times_out,
+    test_learn_mode_suppresses_authentication,
+    test_resync_in_learn_mode,
+    test_survives_restart,
+    test_forget_slot,
+    test_slots_full_then_forget_all,
+]
+
+
+async def run() -> int:
+    failures = 0
+    with tempfile.TemporaryDirectory() as prefdir:
+        dev = Device(prefdir)
+        await dev.start()
+        try:
+            for scenario in SCENARIOS:
+                try:
+                    await scenario(dev)
+                    print(f"PASS  {scenario.__name__}")
+                except Exception as exc:  # noqa: BLE001 - report and stop
+                    failures += 1
+                    print(f"FAIL  {scenario.__name__}: {exc!r}")
+                    print("      later scenarios depend on this one; stopping")
+                    break
+        finally:
+            await dev.stop()
+    print(f"{len(SCENARIOS)} scenarios, {failures} failed")
+    return 1 if failures else 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--no-build", action="store_true", help="reuse the last host build")
+    args = parser.parse_args()
+
+    if not args.no_build:
+        print("Building host program (first run takes a minute)...")
+        build = subprocess.run(
+            [sys.executable, "-m", "esphome", "compile", str(CONFIG)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if build.returncode != 0:
+            print(build.stdout[-4000:])
+            print(build.stderr[-4000:])
+            print("Host build failed")
+            return 1
+    if not BINARY.exists():
+        print(f"Host program not found at {BINARY}; run without --no-build")
+        return 1
+
+    return asyncio.run(run())
+
+
+if __name__ == "__main__":
+    sys.exit(main())

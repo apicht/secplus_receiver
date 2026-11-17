@@ -246,11 +246,26 @@ With `fire_homeassistant_event: true`, learning a remote fires
 
 ### Tests
 
-The slot and counter logic has host unit tests:
+Neither test suite needs an ESP32 or a radio.
+
+**Unit tests** for the slot and counter logic:
 
 ```
 c++ -std=c++17 -Wall -Wextra -o /tmp/test_remote_store tests/test_remote_store.cpp && /tmp/test_remote_store
 ```
+
+**End-to-end tests** build the component for ESPHome's native `host` platform
+and drive it over the real native API, the way Home Assistant would. Remote
+presses are injected as genuine Security+ 2.0 pulse trains, so decoding,
+authentication, learn mode, forgetting, and persistence across restarts are
+all covered. Requires `esphome` and a C++ compiler on Linux or macOS:
+
+```
+python tests/host/run_host_tests.py
+```
+
+These tests do not cover the CC1101, `remote_receiver`, or real-world signal
+timing and noise.
 
 ---
 

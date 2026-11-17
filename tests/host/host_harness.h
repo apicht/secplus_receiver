@@ -1,0 +1,115 @@
+/*
+ * host_harness.h
+ *
+ * Test-only glue for running secplus_receiver on ESPHome's native `host`
+ * platform (see secplus_host.yaml). It is pulled in through
+ * `esphome: includes:` and is never part of a real firmware build.
+ *
+ * It provides two things:
+ *   1. No-op bodies for RemoteReceiverComponent, which has no implementation
+ *      on the host platform (there is no radio to read).
+ *   2. secplus_test_press(), which builds a real Security+ 2.0 transmission
+ *      with the upstream encoder and feeds its pulse timings into the
+ *      component exactly as remote_receiver would.
+ */
+
+#pragma once
+
+#ifdef USE_HOST
+
+#include <cstdint>
+#include <vector>
+
+#include "esphome/components/remote_base/remote_base.h"
+#include "esphome/components/remote_receiver/remote_receiver.h"
+#include "esphome/components/secplus_receiver/secplus_receiver.h"
+#include "esphome/core/log.h"
+
+extern "C" {
+#include "esphome/components/secplus_receiver/secplus.h"
+}
+
+namespace esphome {
+namespace remote_receiver {
+
+void RemoteReceiverComponent::setup() {}
+void RemoteReceiverComponent::dump_config() {}
+void RemoteReceiverComponent::loop() {}
+
+}  // namespace remote_receiver
+}  // namespace esphome
+
+namespace secplus_test {
+
+static const int HALF_BIT_US = 250;   // 4000 baud
+static const int GAP_US = 60000;      // silence between packets
+
+// Append one data bit, Manchester encoded: 0 -> high,low  1 -> low,high.
+inline void push_bit(std::vector<uint8_t> &levels, int bit) {
+  levels.push_back(bit ? 0 : 1);
+  levels.push_back(bit ? 1 : 0);
+}
+
+// One over-the-air packet: 20-bit preamble, 2-bit frame ID, 40-bit payload.
+inline void push_packet(std::vector<uint8_t> &levels, int frame_id, const uint8_t *payload) {
+  for (int i = 0; i < 16; i++) {
+    push_bit(levels, 0);
+  }
+  for (int i = 0; i < 4; i++) {
+    push_bit(levels, 1);
+  }
+  push_bit(levels, 0);
+  push_bit(levels, frame_id);
+  for (int i = 0; i < 40; i++) {
+    push_bit(levels, (payload[i >> 3] >> (7 - (i & 7))) & 1);
+  }
+}
+
+// Convert half-bit levels into signed pulse durations (positive = high,
+// negative = low) followed by a long low gap.
+inline void push_timings(esphome::remote_base::RawTimings &raw, const std::vector<uint8_t> &levels) {
+  size_t i = 0;
+  while (i < levels.size()) {
+    size_t run = 1;
+    while (i + run < levels.size() && levels[i + run] == levels[i]) {
+      run++;
+    }
+    int32_t dur = (int32_t) run * HALF_BIT_US;
+    raw.push_back(levels[i] ? dur : -dur);
+    i += run;
+  }
+  if (!raw.empty() && raw.back() < 0) {
+    raw.back() -= GAP_US;
+  } else {
+    raw.push_back(-GAP_US);
+  }
+}
+
+}  // namespace secplus_test
+
+// Simulate one button press. Like a real remote, the packet pair is sent
+// twice, which also exercises the component's duplicate filter.
+inline void secplus_test_press(esphome::secplus_receiver::SecplusReceiverComponent *rx, uint64_t fixed,
+                               uint32_t rolling) {
+  uint8_t packet1[8] = {0};
+  uint8_t packet2[8] = {0};
+  if (encode_v2(rolling, fixed, 0, 0, packet1, packet2) < 0) {
+    ESP_LOGE("secplus_test", "encode_v2 failed for fixed=%llu rolling=%u", (unsigned long long) fixed,
+             (unsigned) rolling);
+    return;
+  }
+
+  esphome::remote_base::RawTimings raw;
+  for (int repeat = 0; repeat < 2; repeat++) {
+    std::vector<uint8_t> levels;
+    secplus_test::push_packet(levels, 0, packet1);
+    secplus_test::push_timings(raw, levels);
+    levels.clear();
+    secplus_test::push_packet(levels, 1, packet2);
+    secplus_test::push_timings(raw, levels);
+  }
+
+  rx->on_receive(esphome::remote_base::RemoteReceiveData(raw, 25, esphome::remote_base::TOLERANCE_MODE_PERCENTAGE));
+}
+
+#endif  // USE_HOST
