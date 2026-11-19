@@ -281,6 +281,30 @@ Set the `cc1101:` block's `frequency:` to match your remotes:
 
 Security+ 2.0 can use all three frequencies.
 
+### Troubleshooting: presses are received but never decode
+
+If the log shows `Decoder received N pulses to process...` with a few hundred
+pulses on each press, but no `fixed=...` line ever follows, the remote may be
+overloading the CC1101. With the default gain settings and a strong signal,
+the radio chops each 250 / 500 µs pulse into fragments of roughly 100 µs, so
+the decoder never finds a preamble. Adding `dump: raw` to `remote_receiver:`
+shows the pulse widths.
+
+Lowering the gain fixes it. Add this to your own YAML; it merges with the
+`cc1101:` block from the package:
+
+```yaml
+cc1101:
+  magn_target: 33dB
+  rx_attenuation: 18dB
+```
+
+These values were tested with one setup only: a XIAO ESP32-C6, a CC1101 module
+and a 390 MHz remote. There they decoded every press from a few inches away to
+the far end of a house through two walls, where the defaults decoded none.
+Attenuation costs range, so if distant presses start dropping out, lower
+`rx_attenuation` (for example to `6dB` or `12dB`) and test again.
+
 
 ---
 

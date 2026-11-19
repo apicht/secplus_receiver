@@ -109,6 +109,10 @@ cc1101:
   symbol_rate: 4000
   filter_bandwidth: 203kHz
   dc_blocking_filter: true
+  # If presses are received but never decode, the remote may be overloading
+  # the radio. See "Troubleshooting" in the README, then try:
+  # magn_target: 33dB
+  # rx_attenuation: 18dB
 
 # ── remote_receiver ──────────────────────────────────────────────────────────
 #
