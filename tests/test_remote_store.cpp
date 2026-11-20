@@ -84,6 +84,21 @@ static void test_learn_different_remote_restarts_candidate() {
   CHECK(store.learn(REMOTE_A, 101, &slot) == LearnResult::PENDING);  // A must start over
   CHECK(store.learn(REMOTE_A, 102, &slot) == LearnResult::LEARNED);
   CHECK(store.find(REMOTE_B) == -1);
+
+  // A different remote whose counter happens to be one ahead confirms nothing.
+  RemoteStore adjacent;
+  adjacent.init(4);
+  adjacent.start_learn();
+  CHECK(adjacent.learn(REMOTE_A, 100, &slot) == LearnResult::PENDING);
+  CHECK(adjacent.learn(REMOTE_B, 101, &slot) == LearnResult::PENDING);
+  CHECK(adjacent.find(REMOTE_A) == -1 && adjacent.find(REMOTE_B) == -1);
+
+  // The confirming press may be at most LEARN_MAX_STEP ahead.
+  RemoteStore edge;
+  edge.init(4);
+  edge.start_learn();
+  CHECK(edge.learn(REMOTE_A, 100, &slot) == LearnResult::PENDING);
+  CHECK(edge.learn(REMOTE_A, 100 + LEARN_MAX_STEP, &slot) == LearnResult::LEARNED);
 }
 
 static void test_learn_rejects_large_or_backward_step() {
@@ -241,6 +256,131 @@ static void test_restore_from_flash() {
   CHECK(store2.find(REMOTE_A) == 2);
 }
 
+static void test_static_remote_recovers_after_counter_pushed_ahead() {
+  RemoteStore store;
+  store.init(2);
+  size_t idx = store.add_static(REMOTE_A);
+  int slot = -1;
+  CHECK(!store.reset_counter(idx));  // no counter yet
+  CHECK(store.check(REMOTE_A, 100, WINDOW, &slot) == AuthResult::AUTHENTICATED);
+
+  // Forged codes walk the stored counter ahead of the real remote.
+  CHECK(store.check(REMOTE_A, 100 + WINDOW, WINDOW, &slot) == AuthResult::AUTHENTICATED);
+  CHECK(store.check(REMOTE_A, 100 + 2 * WINDOW, WINDOW, &slot) == AuthResult::AUTHENTICATED);
+  // The real remote is now behind: rejected, and learn mode will not resync it.
+  CHECK(store.check(REMOTE_A, 101, WINDOW, &slot) == AuthResult::REJECTED);
+  store.start_learn();
+  CHECK(store.learn(REMOTE_A, 102, &slot) == LearnResult::PENDING);
+  CHECK(store.learn(REMOTE_A, 103, &slot) == LearnResult::REJECTED);
+  CHECK(store.learning());  // a rejected resync leaves learn mode open
+  store.stop_learn();
+
+  // Resetting the counter returns the slot to trust-on-first-use, at any
+  // counter: the real remote may be far beyond the window from zero.
+  CHECK(store.reset_counter(idx));
+  CHECK(store.occupied(idx));
+  CHECK(store.check(REMOTE_A, 50000, WINDOW, &slot) == AuthResult::AUTHENTICATED);
+  CHECK(store.check(REMOTE_A, 50000, WINDOW, &slot) == AuthResult::REJECTED);
+  CHECK(store.check(REMOTE_A, 50001 + WINDOW, WINDOW, &slot) == AuthResult::REJECTED);  // window is back
+
+  CHECK(!store.reset_counter(0));   // learn slots are forgotten, not reset
+  CHECK(!store.reset_counter(99));  // out of range
+}
+
+static void test_static_remote_resyncs_forward_in_learn_mode() {
+  RemoteStore store;
+  store.init(1);
+  size_t idx = store.add_static(REMOTE_A);
+  int slot = -1;
+  CHECK(store.check(REMOTE_A, 100, WINDOW, &slot) == AuthResult::AUTHENTICATED);
+  store.start_learn();
+  CHECK(store.learn(REMOTE_A, 70000, &slot) == LearnResult::PENDING);
+  CHECK(store.learn(REMOTE_A, 70001, &slot) == LearnResult::RESYNCED);
+  CHECK(slot == (int) idx);
+  CHECK(store.slot(idx).rolling == 70001);
+}
+
+static void test_resync_forward_limit_boundary() {
+  const uint32_t stored = 101;
+  for (int over = 0; over <= 1; over++) {
+    RemoteStore store;
+    store.init(1);
+    enrol(store, REMOTE_A, 100);  // stored counter is 101
+    int slot = -1;
+    // Second press lands FORWARD_LIMIT - 1 (allowed) or FORWARD_LIMIT (refused) ahead.
+    uint32_t second = (stored + FORWARD_LIMIT - 1 + (uint32_t) over) & ROLLING_MASK;
+    store.start_learn();
+    CHECK(store.learn(REMOTE_A, (second - 1) & ROLLING_MASK, &slot) == LearnResult::PENDING);
+    CHECK(store.learn(REMOTE_A, second, &slot) == (over ? LearnResult::REJECTED : LearnResult::RESYNCED));
+    CHECK(store.slot(0).rolling == (over ? stored : second));
+  }
+}
+
+static void test_resync_rejects_counter_equal_to_stored() {
+  RemoteStore store;
+  store.init(1);
+  enrol(store, REMOTE_A, 100);  // stored counter is 101
+  int slot = -1;
+  store.start_learn();
+  CHECK(store.learn(REMOTE_A, 100, &slot) == LearnResult::PENDING);
+  CHECK(store.learn(REMOTE_A, 101, &slot) == LearnResult::REJECTED);  // not ahead of 101
+}
+
+static void test_restore_sanitises_saved_records() {
+  const uint8_t both = SLOT_OCCUPIED | SLOT_HAS_COUNTER;
+  RemoteStore store;
+  store.init(2);
+  int slot = -1;
+
+  // Bits above the 28-bit counter are dropped.
+  store.restore(0, RemoteSlot{REMOTE_A, 0xF0000064u, both});
+  CHECK(store.slot(0).rolling == 100);
+  CHECK(store.check(REMOTE_A, 101, WINDOW, &slot) == AuthResult::AUTHENTICATED);
+
+  // A learned record without a counter would be trusted at any counter: not loaded.
+  store.restore(1, RemoteSlot{REMOTE_B, 0, SLOT_OCCUPIED});
+  CHECK(!store.occupied(1));
+  CHECK(store.check(REMOTE_B, 999999, WINDOW, &slot) == AuthResult::UNKNOWN);
+}
+
+static void test_restore_carries_counter_from_learned_copy_to_static() {
+  const uint8_t both = SLOT_OCCUPIED | SLOT_HAS_COUNTER;
+
+  // REMOTE_A was learned (counter 500), then added to the static list.
+  RemoteStore store;
+  store.init(2);
+  size_t idx = store.add_static(REMOTE_A);
+  CHECK(store.restore(0, RemoteSlot{REMOTE_A, 500, both}) == (int) idx);
+  CHECK(!store.occupied(0));
+  int slot = -1;
+  CHECK(store.check(REMOTE_A, 400, WINDOW, &slot) == AuthResult::REJECTED);  // old capture
+  CHECK(store.check(REMOTE_A, 501, WINDOW, &slot) == AuthResult::AUTHENTICATED);
+
+  // The static slot's own saved counter never moves the counter backwards...
+  RemoteStore newer_learned;
+  newer_learned.init(2);
+  idx = newer_learned.add_static(REMOTE_A);
+  newer_learned.restore(0, RemoteSlot{REMOTE_A, 500, both});
+  CHECK(newer_learned.restore(idx, RemoteSlot{REMOTE_A, 300, both}) == -1);
+  CHECK(newer_learned.slot(idx).rolling == 500);
+
+  // ...but does move it forwards.
+  RemoteStore newer_static;
+  newer_static.init(2);
+  idx = newer_static.add_static(REMOTE_A);
+  newer_static.restore(0, RemoteSlot{REMOTE_A, 500, both});
+  newer_static.restore(idx, RemoteSlot{REMOTE_A, 900, both});
+  CHECK(newer_static.slot(idx).rolling == 900);
+
+  // The same remote saved in two learn slots keeps one copy, newest counter.
+  RemoteStore dup;
+  dup.init(2);
+  CHECK(dup.restore(0, RemoteSlot{REMOTE_B, 10, both}) == -1);
+  CHECK(dup.restore(1, RemoteSlot{REMOTE_B, 20, both}) == 0);
+  CHECK(!dup.occupied(1));
+  CHECK(dup.slot(0).rolling == 20);
+}
+
 int main() {
   test_unknown_remote_is_not_authenticated();
   test_learn_needs_two_presses();
@@ -254,6 +394,12 @@ int main() {
   test_static_remote_trusts_first_use_and_cannot_be_forgotten();
   test_resync_moves_forward_only();
   test_restore_from_flash();
+  test_static_remote_recovers_after_counter_pushed_ahead();
+  test_static_remote_resyncs_forward_in_learn_mode();
+  test_resync_forward_limit_boundary();
+  test_resync_rejects_counter_equal_to_stored();
+  test_restore_sanitises_saved_records();
+  test_restore_carries_counter_from_learned_copy_to_static();
 
   printf("%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;

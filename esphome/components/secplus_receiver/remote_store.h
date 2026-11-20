@@ -84,23 +84,35 @@ class RemoteStore {
   // Apply a slot loaded from flash. Learn slots take the saved value whole.
   // Static slots only take the counter, and only if it was saved for the
   // same fixed code that is configured now.
-  void restore(size_t i, const RemoteSlot &saved) {
+  //
+  // Returns -1 normally. If the saved learn slot duplicates a remote that is
+  // already in the table (typically one that has since been added to the
+  // static list), the copy is dropped, its counter is carried over so replay
+  // protection is not lost, and the index of the slot that absorbed it is
+  // returned. The caller should then persist both slot `i` (now empty) and
+  // the returned slot.
+  int restore(size_t i, const RemoteSlot &saved) {
     if (i >= this->slots_.size() || !(saved.flags & SLOT_OCCUPIED)) {
-      return;
+      return -1;
     }
     if (this->is_static(i)) {
-      if (saved.fixed == this->slots_[i].fixed && (saved.flags & SLOT_HAS_COUNTER)) {
-        this->slots_[i].rolling = saved.rolling & ROLLING_MASK;
-        this->slots_[i].flags |= SLOT_HAS_COUNTER;
+      if (saved.fixed == this->slots_[i].fixed) {
+        this->adopt_counter_(this->slots_[i], saved);
       }
-      return;
+      return -1;
     }
-    // A code that is now configured statically wins over a learned copy.
-    if (this->find(saved.fixed) >= 0) {
-      return;
+    int existing = this->find(saved.fixed);
+    if (existing >= 0) {
+      this->adopt_counter_(this->slots_[existing], saved);
+      return existing;
     }
-    this->slots_[i] = saved;
-    this->slots_[i].rolling &= ROLLING_MASK;
+    // A learned remote always has a counter. A record without one is corrupt
+    // and would be trusted at any counter, so it is not loaded.
+    if (!(saved.flags & SLOT_HAS_COUNTER)) {
+      return -1;
+    }
+    this->slots_[i] = RemoteSlot{saved.fixed, saved.rolling & ROLLING_MASK, (uint8_t) (SLOT_OCCUPIED | SLOT_HAS_COUNTER)};
+    return -1;
   }
 
   // Index of the slot holding `fixed`, or -1.
@@ -206,7 +218,37 @@ class RemoteStore {
     return true;
   }
 
+  // Discard the stored counter of a static remote, so its next code is
+  // trusted again as on first use. This is the only way to recover a static
+  // remote whose stored counter has been pushed ahead of the real remote.
+  // Returns false if the index is not an occupied static slot with a counter.
+  // The caller must persist the slot on true.
+  bool reset_counter(size_t i) {
+    if (i >= this->slots_.size() || !this->is_static(i) || !(this->slots_[i].flags & SLOT_HAS_COUNTER)) {
+      return false;
+    }
+    this->slots_[i].rolling = 0;
+    this->slots_[i].flags &= (uint8_t) ~SLOT_HAS_COUNTER;
+    return true;
+  }
+
  protected:
+  // Take over a saved counter, but never move an existing counter backwards.
+  static void adopt_counter_(RemoteSlot &s, const RemoteSlot &saved) {
+    if (!(saved.flags & SLOT_HAS_COUNTER)) {
+      return;
+    }
+    uint32_t rolling = saved.rolling & ROLLING_MASK;
+    if (s.flags & SLOT_HAS_COUNTER) {
+      uint32_t ahead = (rolling - s.rolling) & ROLLING_MASK;
+      if (ahead < 1 || ahead >= FORWARD_LIMIT) {
+        return;
+      }
+    }
+    s.rolling = rolling;
+    s.flags |= SLOT_HAS_COUNTER;
+  }
+
   std::vector<RemoteSlot> slots_;
   size_t learn_slots_{0};
 

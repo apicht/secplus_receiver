@@ -50,8 +50,9 @@ inline void push_bit(std::vector<uint8_t> &levels, int bit) {
   levels.push_back(bit ? 1 : 0);
 }
 
-// One over-the-air packet: 20-bit preamble, 2-bit frame ID, 40-bit payload.
-inline void push_packet(std::vector<uint8_t> &levels, int frame_id, const uint8_t *payload) {
+// One over-the-air packet: 20-bit preamble, 2-bit frame ID, then a 40-bit
+// payload (remote) or a 64-bit payload (keypad).
+inline void push_packet(std::vector<uint8_t> &levels, int frame_id, const uint8_t *payload, int payload_bits) {
   for (int i = 0; i < 16; i++) {
     push_bit(levels, 0);
   }
@@ -60,7 +61,7 @@ inline void push_packet(std::vector<uint8_t> &levels, int frame_id, const uint8_
   }
   push_bit(levels, 0);
   push_bit(levels, frame_id);
-  for (int i = 0; i < 40; i++) {
+  for (int i = 0; i < payload_bits; i++) {
     push_bit(levels, (payload[i >> 3] >> (7 - (i & 7))) & 1);
   }
 }
@@ -89,11 +90,17 @@ inline void push_timings(esphome::remote_base::RawTimings &raw, const std::vecto
 
 // Simulate one button press. Like a real remote, the packet pair is sent
 // twice, which also exercises the component's duplicate filter.
+// With pin >= 0 the press is a keypad entry instead: a 64-bit frame carrying
+// that PIN.
 inline void secplus_test_press(esphome::secplus_receiver::SecplusReceiverComponent *rx, uint64_t fixed,
-                               uint32_t rolling) {
+                               uint32_t rolling, int pin = -1) {
   uint8_t packet1[8] = {0};
   uint8_t packet2[8] = {0};
-  if (encode_v2(rolling, fixed, 0, 0, packet1, packet2) < 0) {
+  const uint8_t frame_type = pin >= 0 ? 1 : 0;
+  const int payload_bits = frame_type ? 64 : 40;
+  // Keypad data: PIN low byte in bits 31..24, high byte in bits 23..16.
+  const uint32_t data = pin >= 0 ? (((uint32_t) pin & 0xff) << 24) | ((((uint32_t) pin >> 8) & 0xff) << 16) : 0;
+  if (encode_v2(rolling, fixed, data, frame_type, packet1, packet2) < 0) {
     ESP_LOGE("secplus_test", "encode_v2 failed for fixed=%llu rolling=%u", (unsigned long long) fixed,
              (unsigned) rolling);
     return;
@@ -102,10 +109,10 @@ inline void secplus_test_press(esphome::secplus_receiver::SecplusReceiverCompone
   esphome::remote_base::RawTimings raw;
   for (int repeat = 0; repeat < 2; repeat++) {
     std::vector<uint8_t> levels;
-    secplus_test::push_packet(levels, 0, packet1);
+    secplus_test::push_packet(levels, 0, packet1, payload_bits);
     secplus_test::push_timings(raw, levels);
     levels.clear();
-    secplus_test::push_packet(levels, 1, packet2);
+    secplus_test::push_packet(levels, 1, packet2, payload_bits);
     secplus_test::push_timings(raw, levels);
   }
 

@@ -93,6 +93,7 @@ ota:
 #    entity_category: config
 #    on_press:
 #      - secplus_receiver.learn: secplus_receiver_id
+## Clears learned remotes only. Entries under `remotes:` stay enrolled.
 #  - platform: template
 #    name: "Forget All Remotes"
 #    entity_category: config

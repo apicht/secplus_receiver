@@ -62,8 +62,9 @@ class SecplusReceiverComponent
   void stop_learn();
   bool is_learning() const { return this->store_.learning(); }
   // Remove the remote in a learnable slot. `slot` is 1-based, as shown in
-  // sensor names, logs and events.
-  void forget(uint8_t slot);
+  // sensor names, logs and events. For a static remote the slot stays
+  // enrolled and only its stored counter is discarded.
+  void forget(int slot);
   void forget_all();
 
   void setup() override;
@@ -195,7 +196,9 @@ template<typename... Ts> class StopLearnAction : public Action<Ts...>, public Pa
 
 template<typename... Ts> class ForgetAction : public Action<Ts...>, public Parented<SecplusReceiverComponent> {
  public:
-  TEMPLATABLE_VALUE(uint8_t, slot)
+  // int, not uint8_t: an out-of-range templated value must be rejected, not
+  // wrapped onto a valid slot.
+  TEMPLATABLE_VALUE(int, slot)
   void play(const Ts &...x) override { this->parent_->forget(this->slot_.value(x...)); }
 };
 

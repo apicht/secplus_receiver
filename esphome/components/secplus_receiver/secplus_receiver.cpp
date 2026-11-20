@@ -149,6 +149,10 @@ static int process_packet(const uint8_t *bits, int nbits, uint8_t *packet, int *
 // Preference keys. Learn slots are keyed by index so that changing
 // max_remotes keeps the slots that still exist. Static remotes are keyed by
 // their fixed code so reordering the YAML list keeps their counters.
+// This holds on platforms that look preferences up by key (ESP32, LibreTiny,
+// host). ESP8266 and RP2040 allocate preferences in creation order, so there
+// a change to max_remotes, to the static list, or to other components that
+// save state can discard the saved slots.
 static const uint32_t SLOT_PREF_BASE = fnv1_hash("secplus_receiver_slot");
 static const uint32_t STATIC_PREF_BASE = fnv1_hash("secplus_receiver_static");
 
@@ -166,11 +170,28 @@ void SecplusReceiverComponent::setup() {
     } else {
       key = SLOT_PREF_BASE + (uint32_t) i;
     }
-    this->slot_prefs_.push_back(global_preferences->make_preference<RemoteSlot>(key));
+    // in_flash=true: on ESP8266 the default storage is RTC memory, which a
+    // power cut erases.
+    this->slot_prefs_.push_back(global_preferences->make_preference<RemoteSlot>(key, true));
+  }
+  // Slots that changed while loading and must be written back.
+  std::vector<size_t> dirty;
+  for (size_t i = 0; i < n; i++) {
     RemoteSlot saved;
     if (this->slot_prefs_[i].load(&saved)) {
-      this->store_.restore(i, saved);
+      int absorbed_by = this->store_.restore(i, saved);
+      if (absorbed_by >= 0) {
+        ESP_LOGI(TAG, "Learned copy of fixed=%" PRIu64 " in slot %u dropped: already in slot %d", saved.fixed,
+                 (unsigned) (i + 1), absorbed_by + 1);
+        dirty.push_back(i);
+        dirty.push_back((size_t) absorbed_by);
+      }
     }
+  }
+  for (size_t i : dirty) {
+    this->save_slot_(i);
+  }
+  for (size_t i = 0; i < n; i++) {
     this->publish_slot_(i);
   }
 }
@@ -250,16 +271,40 @@ void SecplusReceiverComponent::stop_learn() {
   }
 }
 
-void SecplusReceiverComponent::forget(uint8_t slot) {
-  if (slot < 1 || !this->store_.forget((size_t) slot - 1)) {
-    ESP_LOGW(TAG, "Cannot forget slot %u: not a learned remote", slot);
+void SecplusReceiverComponent::forget(int slot) {
+  if (!this->auth_enabled_) {
+    ESP_LOGW(TAG, "Forget requested, but 'authentication' is not configured");
     return;
   }
-  this->save_slot_((size_t) slot - 1);
-  ESP_LOGI(TAG, "Forgot remote in slot %u", slot);
+  if (slot < 1 || (size_t) slot > this->store_.size()) {
+    ESP_LOGW(TAG, "Cannot forget slot %d: there are only slots 1 to %u", slot, (unsigned) this->store_.size());
+    return;
+  }
+  const size_t index = (size_t) slot - 1;
+  if (this->store_.is_static(index)) {
+    // A static remote stays enrolled; forgetting it discards its counter so
+    // a remote that has fallen behind the stored counter can be used again.
+    if (this->store_.reset_counter(index)) {
+      this->save_slot_(index);
+      ESP_LOGI(TAG, "Slot %d is a static remote: counter reset, its next code will be trusted", slot);
+    } else {
+      ESP_LOGI(TAG, "Slot %d is a static remote with no stored counter: nothing to reset", slot);
+    }
+    return;
+  }
+  if (!this->store_.forget(index)) {
+    ESP_LOGW(TAG, "Cannot forget slot %d: it is empty", slot);
+    return;
+  }
+  this->save_slot_(index);
+  ESP_LOGI(TAG, "Forgot remote in slot %d", slot);
 }
 
 void SecplusReceiverComponent::forget_all() {
+  if (!this->auth_enabled_) {
+    ESP_LOGW(TAG, "Forget requested, but 'authentication' is not configured");
+    return;
+  }
   for (size_t i = 0; i < this->store_.learn_slots(); i++) {
     if (this->store_.forget(i)) {
       this->save_slot_(i);
@@ -300,7 +345,8 @@ void SecplusReceiverComponent::handle_learn_(uint64_t fixed, uint32_t rolling) {
       break;
     case LearnResult::FULL:
       this->cancel_timeout("learn");
-      ESP_LOGW(TAG, "Learn failed: all %u slots are in use, forget one first", (unsigned) this->store_.learn_slots());
+      ESP_LOGW(TAG, "Learn failed: no free slot (%u learnable slots), forget one first",
+               (unsigned) this->store_.learn_slots());
       break;
     case LearnResult::NOT_LEARNING:
       break;
@@ -450,6 +496,7 @@ void SecplusReceiverComponent::publish_(uint32_t rolling, uint64_t fixed, uint32
     // While learn mode is open nothing authenticates, so enrolling a remote
     // never triggers whatever the remote normally controls.
     bool authenticated = false;
+    bool rejected = false;
     int slot = -1;  // 0-based index into the store
     if (this->auth_enabled_) {
         if (this->store_.learning()) {
@@ -461,14 +508,23 @@ void SecplusReceiverComponent::publish_(uint32_t rolling, uint64_t fixed, uint32
                     this->save_slot_(slot);
                     ESP_LOGI(TAG, "Authenticated remote in slot %d (rolling=%u)", slot + 1, (unsigned) rolling);
                     break;
-                case AuthResult::REJECTED:
-                    ESP_LOGW(TAG,
-                             "Rejected remote in slot %d: rolling=%u is not within %u ahead of stored %u "
-                             "(replay, or remote too far ahead; re-learn to resync)",
-                             slot + 1, (unsigned) rolling, (unsigned) this->window_,
-                             (unsigned) this->store_.slot(slot).rolling);
-                    this->rejected_callback_.call(fixed, rolling, (uint8_t) (slot + 1));
+                case AuthResult::REJECTED: {
+                    const uint32_t stored = this->store_.slot(slot).rolling;
+                    const uint32_t ahead = (rolling - stored) & ROLLING_MASK;
+                    if (ahead >= 1 && ahead < FORWARD_LIMIT) {
+                        ESP_LOGW(TAG,
+                                 "Rejected remote in slot %d: rolling=%u is more than %u ahead of stored %u. "
+                                 "Open learn mode and press the remote twice to resync",
+                                 slot + 1, (unsigned) rolling, (unsigned) this->window_, (unsigned) stored);
+                    } else {
+                        ESP_LOGW(TAG,
+                                 "Rejected remote in slot %d: rolling=%u is not ahead of stored %u (replay or old "
+                                 "code). If this is the real remote, forget the slot to start over",
+                                 slot + 1, (unsigned) rolling, (unsigned) stored);
+                    }
+                    rejected = true;
                     break;
+                }
                 case AuthResult::UNKNOWN:
                     break;
             }
@@ -481,6 +537,8 @@ void SecplusReceiverComponent::publish_(uint32_t rolling, uint64_t fixed, uint32
 
     if (authenticated) {
         this->authenticated_callback_.call(fixed, remote_id, button, rolling, (uint8_t) (slot + 1));
+    } else if (rejected) {
+        this->rejected_callback_.call(fixed, rolling, (uint8_t) (slot + 1));
     }
 
     char buf[24];

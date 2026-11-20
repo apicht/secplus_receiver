@@ -160,13 +160,15 @@ AUTHENTICATION_SCHEMA = cv.All(
             cv.Optional(CONF_MAX_REMOTES, default=8): cv.int_range(min=0, max=32),
             # The rolling code is a 28-bit counter that rises by one per press.
             cv.Optional(CONF_WINDOW, default=1024): cv.int_range(min=1, max=65535),
-            cv.Optional(
-                CONF_LEARN_TIMEOUT, default="30s"
-            ): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_LEARN_TIMEOUT, default="30s"): cv.All(
+                cv.positive_time_period_milliseconds,
+                cv.Range(min=cv.TimePeriod(seconds=1)),
+            ),
             cv.Optional(CONF_SLOT_SENSORS, default=True): cv.boolean,
             # Fixed codes are 40 bits.
-            cv.Optional(CONF_REMOTES, default=[]): cv.ensure_list(
-                cv.int_range(min=0, max=(1 << 40) - 1)
+            cv.Optional(CONF_REMOTES, default=[]): cv.All(
+                cv.ensure_list(cv.int_range(min=0, max=(1 << 40) - 1)),
+                cv.Length(max=32),
             ),
         }
     ),
@@ -257,7 +259,8 @@ _PARENT_ACTION_SCHEMA = automation.maybe_simple_id(
 _FORGET_ACTION_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.use_id(SecplusReceiverComponent),
-        cv.Required(CONF_SLOT): cv.templatable(cv.int_range(min=1, max=32)),
+        # Up to 32 learnable slots followed by up to 32 static remotes.
+        cv.Required(CONF_SLOT): cv.templatable(cv.int_range(min=1, max=64)),
     }
 )
 
@@ -283,7 +286,7 @@ for _name, _class in (
 )
 async def _forget_action_to_code(config, action_id, template_arg, args):
     var = await _parent_action_to_code(config, action_id, template_arg, args)
-    cg.add(var.set_slot(await cg.templatable(config[CONF_SLOT], args, cg.uint8)))
+    cg.add(var.set_slot(await cg.templatable(config[CONF_SLOT], args, cg.int_)))
     return var
 
 
