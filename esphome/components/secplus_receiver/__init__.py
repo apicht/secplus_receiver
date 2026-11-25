@@ -77,6 +77,7 @@ from esphome import automation
 from esphome.components import remote_base, remote_receiver, text_sensor
 import esphome.config_validation as cv
 import esphome.final_validate as fv
+from esphome.core import CORE
 from esphome.const import CONF_ID, CONF_NAME, CONF_TRIGGER_ID, ENTITY_CATEGORY_DIAGNOSTIC
 
 _LOGGER = logging.getLogger(__name__)
@@ -262,15 +263,27 @@ CONFIG_SCHEMA = cv.All(
 )
 
 # On ESP32 remote_receiver cuts a burst at `receive_symbols` symbols (two
-# pulses each). A press sends its packet several times in one burst, and two
-# whole packets can take 250 symbols, so a smaller limit leaves only one
-# complete packet and require_repeat would never see its repeat.
+# pulses each). On the ESP32 and ESP32-S2 the RMT hardware also stops when its
+# channel memory, `rmt_symbols`, is full, so there the lower of the two is the
+# limit. A press sends its packet several times in one burst and
+# require_repeat needs two whole packets from it: up to 232 symbols for a
+# remote (40-bit packets) and up to 328 for a keypad (64-bit packets).
 CONF_RECEIVE_SYMBOLS = "receive_symbols"
+CONF_RMT_SYMBOLS = "rmt_symbols"
 MIN_RECEIVE_SYMBOLS = 256
+KEYPAD_RECEIVE_SYMBOLS = 328
 
 
 def _require_repeat(config: dict) -> bool:
     return config.get(CONF_REQUIRE_REPEAT, CONF_AUTHENTICATION in config)
+
+
+def _rmt_memory_limits_receive() -> bool:
+    if not CORE.is_esp32:
+        return False
+    from esphome.components import esp32
+
+    return esp32.get_esp32_variant() in (esp32.VARIANT_ESP32, esp32.VARIANT_ESP32S2)
 
 
 def _final_validate(config: dict) -> dict:
@@ -282,8 +295,18 @@ def _final_validate(config: dict) -> dict:
         receiver = full.get_config_for_path(path)
     except KeyError:
         return config
-    symbols = receiver.get(CONF_RECEIVE_SYMBOLS)  # only present on ESP32
-    if symbols is not None and symbols < MIN_RECEIVE_SYMBOLS:
+    symbols = receiver.get(CONF_RECEIVE_SYMBOLS)  # only present on ESP32 with RMT
+    if symbols is None:
+        return config
+    limit = symbols
+    fix = f"Set '{CONF_RECEIVE_SYMBOLS}: 512' under 'remote_receiver:'"
+    if _rmt_memory_limits_receive():
+        limit = min(symbols, receiver.get(CONF_RMT_SYMBOLS, symbols))
+        fix = (
+            f"Set '{CONF_RECEIVE_SYMBOLS}' and '{CONF_RMT_SYMBOLS}' under "
+            f"'remote_receiver:' to 384 (256 on an ESP32-S2)"
+        )
+    if limit < MIN_RECEIVE_SYMBOLS:
         reason = (
             f"'{CONF_AUTHENTICATION}' turns on '{CONF_REQUIRE_REPEAT}'"
             if CONF_REQUIRE_REPEAT not in config
@@ -291,9 +314,18 @@ def _final_validate(config: dict) -> dict:
         )
         raise cv.Invalid(
             f"{reason}, which needs two whole packets from one press, but "
-            f"remote_receiver stops a burst after {symbols} symbols and that holds "
-            f"only one. Set '{CONF_RECEIVE_SYMBOLS}: 512' under 'remote_receiver:' "
-            f"(minimum {MIN_RECEIVE_SYMBOLS}), or set '{CONF_REQUIRE_REPEAT}: false'."
+            f"remote_receiver stops a burst after {limit} symbols and that holds "
+            f"only one. {fix} (minimum {MIN_RECEIVE_SYMBOLS}), or set "
+            f"'{CONF_REQUIRE_REPEAT}: false'."
+        )
+    if limit < KEYPAD_RECEIVE_SYMBOLS:
+        _LOGGER.warning(
+            "secplus_receiver: remote_receiver stops a burst after %d symbols. That is "
+            "enough for remotes, but '%s' needs %d for keypads, so keypad presses "
+            "will be ignored.",
+            limit,
+            CONF_REQUIRE_REPEAT,
+            KEYPAD_RECEIVE_SYMBOLS,
         )
     return config
 

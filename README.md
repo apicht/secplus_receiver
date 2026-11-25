@@ -211,7 +211,7 @@ To accept every default, write `authentication: {}`.
 A corrupted reception can decode to a plausible but wrong code. So that such
 a code can never authenticate or move a stored counter, the component acts on
 a code only after two packets in a row, at most 1.5 seconds apart, decode to
-the same fixed code and rolling code. A remote repeats its packet while the
+the same fixed code, rolling code and payload. A remote repeats its packet while the
 button is held, so a normal press passes; a very short press at the edge of
 range may not. Until the repeat arrives nothing happens: no sensor update, no
 trigger, no event.
@@ -219,10 +219,23 @@ trigger, no event.
 On ESP32 this needs a larger receive buffer than the `remote_receiver`
 default. A press sends its packet about three times in one burst of roughly
 600 pulses, and the default `receive_symbols: 192` cuts the burst at 384
-pulses, during the second packet. The packaged `secplus_receiver.yaml` sets
-`receive_symbols: 512`. If you write your own `remote_receiver:` block, set it
-there; the configuration is rejected if it is below 256 while this check is
-on.
+pulses, during the second packet. Set it under `remote_receiver:`:
+
+```yaml
+remote_receiver:
+  receive_symbols: 512
+  # rmt_symbols: 384   # also needed on the ESP32 and ESP32-S2 (256 on an S2)
+```
+
+* On the ESP32 and ESP32-S2 the RMT hardware also stops when its channel
+  memory (`rmt_symbols`, default 192) is full, so both options must be raised.
+  This follows the ESPHome documentation and was not tested on those boards.
+* The configuration is rejected if the limit is below 256 while this check is
+  on. 256 is enough for remotes. Keypads send longer packets and need 328, so
+  ESPHome prints a warning below that. An ESP32-S2 has only 256 symbols of RMT
+  memory, so keypads cannot pass this check there.
+* ESP8266, RP2040, ESP32-C2 and ESP32-C61 do not have these options and need
+  no change.
 
 This is on by default when `authentication:` is configured and off otherwise.
 Set it explicitly with the top-level option:
@@ -414,9 +427,7 @@ secplus_receiver/
             ├── __init__.py           ← config schema + build-time downloader
             ├── secplus_receiver.h    ← SecplusReceiverComponent C++ class
             ├── remote_store.h        ← enrolled-remote table (authentication)
-            ├── secplus_parser.c      ← Manchester / Security+ 2.0 frame decoder
-            ├── secplus_parser.h
-            └── secplus_shim.h        ← ManchesterDecoder C++ wrapper
+            └── secplus_receiver.cpp  ← Manchester / Security+ 2.0 frame decoder
             # secplus.c & secplus.h are downloaded here at build time
 ```
 ---

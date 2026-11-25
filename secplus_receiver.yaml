@@ -125,7 +125,11 @@ remote_receiver:
     # inverted: true   # uncomment if your hardware inverts the signal
   tolerance: 50%
   buffer_size: 20kb
-  # A press sends its packet several times in one burst. The ESP32 default of
-  # 192 symbols cuts the burst during the second packet.
-  receive_symbols: 512
+  # ESP32 only, and needed when authentication (or require_repeat) is on: a
+  # press sends its packet several times in one burst, and the default of 192
+  # symbols cuts the burst during the second packet. On an ESP32 or ESP32-S2
+  # set rmt_symbols as well (384, or 256 on an S2). Leave both out on ESP8266,
+  # RP2040, ESP32-C2 and ESP32-C61, which do not have these options.
+  # receive_symbols: 512
+  # rmt_symbols: 384
 
