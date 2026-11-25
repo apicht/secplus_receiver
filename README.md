@@ -146,6 +146,227 @@ secplus_receiver:
 
 ---
 
+## Authentication (optional)
+
+By default every decoded remote is reported, and a recorded transmission can
+simply be replayed. Enabling `authentication` adds an allowlist of enrolled
+remotes and rolling-counter replay protection, the same kind of check a real
+opener performs.
+
+> **Security limit:** Security+ 2.0 has no secret key. Anyone who captures a
+> single transmission can compute the next valid code, and no receiver can
+> prevent that. Treat this as replay protection, not strong authentication.
+>
+> In practice that means:
+>
+> * The fixed code and rolling counter are all an attacker needs, and this
+>   component publishes both: in the sensors, the `esphome.secplus_received`
+>   event, the "Remote Slot N" sensors and the device log. Anyone who can read
+>   your Home Assistant or the device log can forge a remote. Leave out the
+>   sensors and events you do not use.
+> * Anyone in radio range while learn mode is open can enrol a forged remote.
+>   Keep `learn_timeout` short and check which slot was filled.
+> * Someone forging codes for an enrolled remote can push its stored counter
+>   ahead, so the real remote stops working until it is re-enrolled (see
+>   below).
+> * A remote listed under `remotes:` has no stored counter until its first
+>   press, so the first code heard for it is accepted whatever its counter,
+>   including an old recording. This applies on a fresh install, after a flash
+>   erase, and after `secplus_receiver.forget` on its slot. Learned remotes do
+>   not have this gap.
+> * A keypad is authenticated by its fixed code alone. The PIN typed on it is
+>   not checked; compare `pincode` from the event yourself if you rely on it.
+
+```yaml
+secplus_receiver:
+  id: secplus_receiver_id
+  authentication:
+    max_remotes: 8       # learnable slots (0-32), default 8
+    window: 1024         # accepted distance ahead of the stored counter, default 1024
+    learn_timeout: 30s   # how long learn mode stays open, default 30s, minimum 1s
+    slot_sensors: true   # create a "Remote Slot N" text sensor per slot, default true
+    remotes:             # optional: fixed codes that are always enrolled
+      - 70678577664
+  on_authenticated:
+    then:
+      - logger.log:
+          format: "Authenticated remote in slot %u, button %u"
+          args: [slot, button]
+```
+
+To accept every default, write `authentication: {}`.
+
+### How a press is checked
+
+* The fixed code must be enrolled, either learned into a slot or listed under
+  `remotes:`.
+* The rolling code must be 1 to `window` counts ahead of the last accepted
+  code for that remote. Anything else, including a replay, is rejected.
+* The accepted counter is written to flash immediately, so it survives a
+  power cut.
+* The code must be decoded from two packets in a row (see below).
+
+### Requiring a repeated packet
+
+A corrupted reception can decode to a plausible but wrong code. So that such
+a code can never authenticate or move a stored counter, the component acts on
+a code only after two packets in a row, at most 1.5 seconds apart, decode to
+the same fixed code, rolling code and payload. A remote repeats its packet while the
+button is held, so a normal press passes; a very short press at the edge of
+range may not. Until the repeat arrives nothing happens: no sensor update, no
+trigger, no event.
+
+On ESP32 this needs a larger receive buffer than the `remote_receiver`
+default. A press sends its packet about three times in one burst of roughly
+600 pulses, and the default `receive_symbols: 192` cuts the burst at 384
+pulses, during the second packet. Set it under `remote_receiver:`:
+
+```yaml
+remote_receiver:
+  receive_symbols: 512
+  # rmt_symbols: 384   # also needed on the ESP32 and ESP32-S2 (256 on an S2)
+```
+
+* On the ESP32 and ESP32-S2 the RMT hardware also stops when its channel
+  memory (`rmt_symbols`, default 192) is full, so both options must be raised.
+  This follows the ESPHome documentation and was not tested on those boards.
+* The configuration is rejected if the limit is below 256 while this check is
+  on. 256 is enough for remotes. Keypads send longer packets and need 328, so
+  ESPHome prints a warning below that. An ESP32-S2 has only 256 symbols of RMT
+  memory, so keypads cannot pass this check there.
+* ESP8266, RP2040, ESP32-C2 and ESP32-C61 do not have these options and need
+  no change.
+
+This is on by default when `authentication:` is configured and off otherwise.
+Set it explicitly with the top-level option:
+
+```yaml
+secplus_receiver:
+  require_repeat: true
+```
+
+Two things this does not do:
+
+* Replaying the most recent transmission straight away is dropped as a
+  duplicate before authentication runs. It never authenticates, but it does
+  not fire `on_rejected` either.
+* A remote that gets more than `window` presses ahead is not accepted again
+  on its own. Open learn mode and press it twice to resync.
+
+Each button on a remote has its own fixed code and is enrolled separately.
+
+### Learning and forgetting remotes
+
+| Action | Effect |
+|---|---|
+| `secplus_receiver.learn` | Opens learn mode for `learn_timeout`. Press the new remote's button **twice**; it is stored in the first free slot and learn mode closes. |
+| `secplus_receiver.stop_learn` | Closes learn mode early. |
+| `secplus_receiver.forget` | Clears one slot (`slot:` is 1-based and templatable). On a `remotes:` entry it keeps the remote enrolled and only discards its stored counter. |
+| `secplus_receiver.forget_all` | Clears every learned slot. Does not touch `remotes:` entries or their counters. |
+
+While learn mode is open no remote authenticates, so enrolling never triggers
+your automations. Pressing an already-enrolled remote twice in learn mode
+moves its stored counter forward, which recovers a remote that was pressed
+more than `window` times out of range.
+
+Learn mode never moves a counter backwards. If a remote's stored counter has
+ended up *ahead* of the real remote (see the security limit above), forget
+its slot and learn it again. For a remote listed under `remotes:`, run
+`secplus_receiver.forget` on its slot: the remote stays enrolled and its next
+press is trusted, the same as on first use.
+
+Expose the actions as Home Assistant entities, or wire `learn` to a GPIO button:
+
+```yaml
+button:
+  - platform: template
+    name: "Learn Remote"
+    on_press:
+      - secplus_receiver.learn: secplus_receiver_id
+  - platform: template
+    name: "Forget All Remotes"
+    on_press:
+      - secplus_receiver.forget_all: secplus_receiver_id
+
+api:
+  actions:
+    - action: forget_remote      # esphome.<device>_forget_remote in Home Assistant
+      variables:
+        slot: int
+      then:
+        - secplus_receiver.forget:
+            id: secplus_receiver_id
+            slot: !lambda "return slot;"
+```
+
+Each "Remote Slot N" sensor shows the fixed code stored in that slot, or
+`empty`. Slots hold codes, not names; map slots to people in your automations.
+Remotes listed under `remotes:` are numbered after the learnable slots, have
+no sensor, and can only be removed by editing the YAML. Their slot numbers
+therefore change if you change `max_remotes`.
+
+If you add a learned remote's code to `remotes:`, its learned slot is freed
+on the next boot and its counter is carried over.
+
+On ESP32, learned remotes and counters survive firmware updates and
+configuration changes; a full flash erase removes them. Authentication has
+only been tested on ESP32. On ESP8266 and RP2040, ESPHome stores saved state
+in creation order rather than by name, so changing `max_remotes`, the
+`remotes:` list, or other components that save state can discard the stored
+remotes and counters.
+
+Lowering `max_remotes` hides the remotes in the removed slots without erasing
+them. Raising it again brings them back with the counters they had, so forget
+those slots first if the remotes should stay removed.
+
+Every accepted press writes one small record to flash. At normal use that is
+negligible wear. Someone who has captured a press can forge codes that are
+accepted, and each one causes a write. On ESP32 the writes are spread over a
+wear-levelled partition, so this is not a practical concern. On ESP8266 every
+write erases the same flash sector, which is typically rated for about
+100,000 erase cycles, so a sustained stream of forged presses could wear it
+out within hours.
+
+### Triggers and events
+
+| Trigger | Variables |
+|---|---|
+| `on_authenticated` | `fixed_data`, `remote_id`, `button`, `rolling`, `slot` |
+| `on_rejected` | `fixed_data`, `rolling`, `slot` (an enrolled remote sent a code outside the window, for example a replay of an older code) |
+| `on_remote_learned` | `fixed_data`, `slot` |
+
+`on_remote_received`, the sensors and the `esphome.secplus_received` event
+still fire for every remote. With authentication enabled the event also
+carries `authenticated` (`true` / `false`) and, when authenticated, `slot`.
+With `fire_homeassistant_event: true`, learning a remote fires
+`esphome.secplus_remote_learned` with `fixed_data` and `slot`.
+
+### Tests
+
+Neither test suite needs an ESP32 or a radio.
+
+**Unit tests** for the slot and counter logic:
+
+```
+c++ -std=c++17 -Wall -Wextra -o /tmp/test_remote_store tests/test_remote_store.cpp && /tmp/test_remote_store
+```
+
+**End-to-end tests** build the component for ESPHome's native `host` platform
+and drive it over the real native API, the way Home Assistant would. Remote
+presses are injected as genuine Security+ 2.0 pulse trains, so decoding,
+frame pairing, authentication, learn mode, forgetting, the triggers, keypad
+frames, and persistence across a hard kill are all covered. Requires `esphome` and a C++
+compiler on Linux or macOS:
+
+```
+python tests/host/run_host_tests.py
+```
+
+These tests do not cover the CC1101, `remote_receiver`, or real-world signal
+timing and noise.
+
+---
+
 ## CC1101 frequency
 
 Set the `cc1101:` block's `frequency:` to match your remotes:
@@ -157,6 +378,30 @@ Set the `cc1101:` block's `frequency:` to match your remotes:
 | `310.00MHz` | Some regional and older variants |
 
 Security+ 2.0 can use all three frequencies.
+
+### Troubleshooting: presses are received but never decode
+
+If the log shows `Decoder received N pulses to process...` with a few hundred
+pulses on each press, but no `fixed=...` line ever follows, the remote may be
+overloading the CC1101. With the default gain settings and a strong signal,
+the radio chops each 250 / 500 µs pulse into fragments of roughly 100 µs, so
+the decoder never finds a preamble. Adding `dump: raw` to `remote_receiver:`
+shows the pulse widths.
+
+Lowering the gain fixes it. Add this to your own YAML; it merges with the
+`cc1101:` block from the package:
+
+```yaml
+cc1101:
+  magn_target: 33dB
+  rx_attenuation: 18dB
+```
+
+These values were tested with one setup only: a XIAO ESP32-C6, a CC1101 module
+and a 390 MHz remote. There they decoded every press from a few inches away to
+the far end of a house through two walls, where the defaults decoded none.
+Attenuation costs range, so if distant presses start dropping out, lower
+`rx_attenuation` (for example to `6dB` or `12dB`) and test again.
 
 
 ---
@@ -181,9 +426,8 @@ secplus_receiver/
         └── secplus_receiver/
             ├── __init__.py           ← config schema + build-time downloader
             ├── secplus_receiver.h    ← SecplusReceiverComponent C++ class
-            ├── secplus_parser.c      ← Manchester / Security+ 2.0 frame decoder
-            ├── secplus_parser.h
-            └── secplus_shim.h        ← ManchesterDecoder C++ wrapper
+            ├── remote_store.h        ← enrolled-remote table (authentication)
+            └── secplus_receiver.cpp  ← Manchester / Security+ 2.0 frame decoder
             # secplus.c & secplus.h are downloaded here at build time
 ```
 ---

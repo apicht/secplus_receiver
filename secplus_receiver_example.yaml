@@ -73,3 +73,41 @@ ota:
   - platform: esphome
     password: !secret ota_password
 
+# ── Optional: authentication (learn / forget remotes) ────────────────────────
+#
+# Uncomment to enrol remotes and reject replayed codes. See "Authentication"
+# in the README. `secplus_receiver_id` is the component id set by the package.
+
+#secplus_receiver:
+#  authentication:
+#    max_remotes: 8
+#  on_authenticated:
+#    then:
+#      - logger.log:
+#          format: "Authenticated remote in slot %u, button %u"
+#          args: [slot, button]
+#
+#button:
+#  - platform: template
+#    name: "Learn Remote"
+#    entity_category: config
+#    on_press:
+#      - secplus_receiver.learn: secplus_receiver_id
+## Clears learned remotes only. Entries under `remotes:` stay enrolled.
+#  - platform: template
+#    name: "Forget All Remotes"
+#    entity_category: config
+#    on_press:
+#      - secplus_receiver.forget_all: secplus_receiver_id
+#
+## Adds the Home Assistant action "esphome.<device>_forget_remote" (slot: N).
+## Merge this into the `api:` block above.
+#api:
+#  actions:
+#    - action: forget_remote
+#      variables:
+#        slot: int
+#      then:
+#        - secplus_receiver.forget:
+#            id: secplus_receiver_id
+#            slot: !lambda "return slot;"

@@ -75,6 +75,13 @@ secplus_receiver:
   # the remote_id, button, and rolling_code.
   #fire_homeassistant_event: true
 
+  # -- Authentication is disabled by default --
+  # Enrol remotes and reject replayed codes. See "Authentication" in the README.
+  #authentication:
+  #  max_remotes: 8       # learnable slots, each gets a "Remote Slot N" sensor
+  #  window: 1024         # how far ahead of the stored counter a code may be
+  #  learn_timeout: 30s
+
 
 # ── Needed if fire_homeassistant_event is trues ──────────────────────────────
 api:
@@ -102,6 +109,10 @@ cc1101:
   symbol_rate: 4000
   filter_bandwidth: 203kHz
   dc_blocking_filter: true
+  # If presses are received but never decode, the remote may be overloading
+  # the radio. See "Troubleshooting" in the README, then try:
+  # magn_target: 33dB
+  # rx_attenuation: 18dB
 
 # ── remote_receiver ──────────────────────────────────────────────────────────
 #
@@ -114,4 +125,11 @@ remote_receiver:
     # inverted: true   # uncomment if your hardware inverts the signal
   tolerance: 50%
   buffer_size: 20kb
+  # ESP32 only, and needed when authentication (or require_repeat) is on: a
+  # press sends its packet several times in one burst, and the default of 192
+  # symbols cuts the burst during the second packet. On an ESP32 or ESP32-S2
+  # set rmt_symbols as well (384, or 256 on an S2). Leave both out on ESP8266,
+  # RP2040, ESP32-C2 and ESP32-C61, which do not have these options.
+  # receive_symbols: 512
+  # rmt_symbols: 384
 

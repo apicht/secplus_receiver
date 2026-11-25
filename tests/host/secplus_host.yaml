@@ -1,0 +1,119 @@
+# secplus_host.yaml
+#
+# Test build of secplus_receiver for ESPHome's native `host` platform. It runs
+# as an ordinary program on Linux or macOS, with no ESP32 or radio.
+# run_host_tests.py compiles and drives it; see the README.
+#
+# The `press` action stands in for a remote: it injects a real Security+ 2.0
+# transmission (built by host_harness.h) into the component.
+
+esphome:
+  name: secplus-host
+  includes:
+    - host_harness.h
+
+host:
+  mac_address: "06:35:69:ab:f6:79"
+
+logger:
+  level: DEBUG
+
+external_components:
+  - source:
+      type: local
+      path: ../../esphome/components
+
+api:
+  port: 16053
+  homeassistant_services: true
+  actions:
+    - action: press
+      variables:
+        fixed: string   # 40-bit fixed code as decimal text
+        rolling: int
+      then:
+        - lambda: |-
+            secplus_test_press(id(rx), strtoull(fixed.c_str(), nullptr, 10), (uint32_t) rolling);
+    - action: press_keypad
+      variables:
+        fixed: string
+        rolling: int
+        pin: int
+      then:
+        - lambda: |-
+            secplus_test_press(id(rx), strtoull(fixed.c_str(), nullptr, 10), (uint32_t) rolling, pin);
+    - action: inject   # chosen frames of one transmission; see host_harness.h
+      variables:
+        fixed: string
+        rolling: int
+        frames: string
+      then:
+        - lambda: |-
+            secplus_test_inject(id(rx), strtoull(fixed.c_str(), nullptr, 10), (uint32_t) rolling, frames);
+    - action: set_require_repeat
+      variables:
+        enabled: bool
+      then:
+        - lambda: |-
+            id(rx).set_require_repeat(enabled);
+    - action: forget_remote
+      variables:
+        slot: int
+      then:
+        - secplus_receiver.forget:
+            id: rx
+            slot: !lambda "return slot;"
+
+remote_receiver:
+  pin: 2
+
+secplus_receiver:
+  id: rx
+  fixed_data_sensor:
+    name: Fixed Data
+  rolling_code_sensor:
+    name: Rolling Code
+  fire_homeassistant_event: true
+  authentication:
+    max_remotes: 2
+    window: 16
+    learn_timeout: 2s
+    remotes:
+      - 123456789   # static remote, becomes slot 3
+  # Each trigger reports itself as an event so the tests can see it fire.
+  on_remote_received:
+    - homeassistant.event:
+        event: esphome.test_received
+        data:
+          rolling: !lambda "return (int) rolling;"
+  on_authenticated:
+    - homeassistant.event:
+        event: esphome.test_authenticated
+        data:
+          rolling: !lambda "return (int) rolling;"
+          slot: !lambda "return (int) slot;"
+  on_rejected:
+    - homeassistant.event:
+        event: esphome.test_rejected
+        data:
+          rolling: !lambda "return (int) rolling;"
+          slot: !lambda "return (int) slot;"
+  on_remote_learned:
+    - homeassistant.event:
+        event: esphome.test_learned
+        data:
+          slot: !lambda "return (int) slot;"
+
+button:
+  - platform: template
+    name: Learn Remote
+    on_press:
+      - secplus_receiver.learn: rx
+  - platform: template
+    name: Stop Learning
+    on_press:
+      - secplus_receiver.stop_learn: rx
+  - platform: template
+    name: Forget All Remotes
+    on_press:
+      - secplus_receiver.forget_all: rx
