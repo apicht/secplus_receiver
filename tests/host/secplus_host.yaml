@@ -42,6 +42,20 @@ api:
       then:
         - lambda: |-
             secplus_test_press(id(rx), strtoull(fixed.c_str(), nullptr, 10), (uint32_t) rolling, pin);
+    - action: inject   # chosen frames of one transmission; see host_harness.h
+      variables:
+        fixed: string
+        rolling: int
+        frames: string
+      then:
+        - lambda: |-
+            secplus_test_inject(id(rx), strtoull(fixed.c_str(), nullptr, 10), (uint32_t) rolling, frames);
+    - action: set_require_repeat
+      variables:
+        enabled: bool
+      then:
+        - lambda: |-
+            id(rx).set_require_repeat(enabled);
     - action: forget_remote
       variables:
         slot: int

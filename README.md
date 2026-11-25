@@ -204,6 +204,33 @@ To accept every default, write `authentication: {}`.
   code for that remote. Anything else, including a replay, is rejected.
 * The accepted counter is written to flash immediately, so it survives a
   power cut.
+* The code must be decoded from two packets in a row (see below).
+
+### Requiring a repeated packet
+
+A corrupted reception can decode to a plausible but wrong code. So that such
+a code can never authenticate or move a stored counter, the component acts on
+a code only after two packets in a row, at most 1.5 seconds apart, decode to
+the same fixed code and rolling code. A remote repeats its packet while the
+button is held, so a normal press passes; a very short press at the edge of
+range may not. Until the repeat arrives nothing happens: no sensor update, no
+trigger, no event.
+
+On ESP32 this needs a larger receive buffer than the `remote_receiver`
+default. A press sends its packet about three times in one burst of roughly
+600 pulses, and the default `receive_symbols: 192` cuts the burst at 384
+pulses, during the second packet. The packaged `secplus_receiver.yaml` sets
+`receive_symbols: 512`. If you write your own `remote_receiver:` block, set it
+there; the configuration is rejected if it is below 256 while this check is
+on.
+
+This is on by default when `authentication:` is configured and off otherwise.
+Set it explicitly with the top-level option:
+
+```yaml
+secplus_receiver:
+  require_repeat: true
+```
 
 Two things this does not do:
 
@@ -314,8 +341,8 @@ c++ -std=c++17 -Wall -Wextra -o /tmp/test_remote_store tests/test_remote_store.c
 **End-to-end tests** build the component for ESPHome's native `host` platform
 and drive it over the real native API, the way Home Assistant would. Remote
 presses are injected as genuine Security+ 2.0 pulse trains, so decoding,
-authentication, learn mode, forgetting, the triggers, keypad frames, and
-persistence across a hard kill are all covered. Requires `esphome` and a C++
+frame pairing, authentication, learn mode, forgetting, the triggers, keypad
+frames, and persistence across a hard kill are all covered. Requires `esphome` and a C++
 compiler on Linux or macOS:
 
 ```

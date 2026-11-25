@@ -20,7 +20,10 @@
  */
 
 #include "secplus_receiver.h"
+#include "esphome/core/hal.h"
 #include "esphome/core/log.h"
+
+#include <cstring>
 
 extern "C" {
 #include "secplus.h"
@@ -37,6 +40,15 @@ static const int LONG_THRESH = 625;    // |dur| >= this -> packet gap / flush
 
 static const int MAX_MANCHESTER = 512;   // max Manchester bits in flight
 static const int MAX_DECODED_BITS = 256;  // max decoded payload bits per packet
+static const int MAX_DECODED_BYTES = MAX_DECODED_BITS / 8;
+
+// The two frames of a packet are sent back to back. A stored frame 1 older
+// than this belongs to an earlier transmission and must not be paired.
+static const uint32_t PAIR_TIMEOUT_MS = 250;
+
+// With require_repeat, the same code must be decoded twice within this time.
+// A remote repeats its packet several times per press, well inside it.
+static const uint32_t REPEAT_WINDOW_MS = 1500;
 
 // Preamble: 0x0F Manchester-encoded = "1010101001010101" = 0xAA55
 static const int PREAMBLE_BITS = 16;
@@ -104,8 +116,11 @@ static int manchester_decode(const uint8_t *bits, int start, int nbits, uint8_t 
 // Finds the preamble, reads the 2-field header (frame ID + packet length), then
 // Manchester-decodes the payload into the packed packet buffer.
 // Returns frame_id (1 or 2), -1 if no preamble / insufficient data, or -2 on
-// unknown header values / decode overflow.
-static int process_packet(const uint8_t *bits, int nbits, uint8_t *packet, int *packet_length) {
+// unknown header values / decode overflow. *expected_length is the payload
+// size the header announces; a frame is complete only if *packet_length
+// equals it.
+static int process_packet(const uint8_t *bits, int nbits, uint8_t *packet, int *packet_length,
+                          int *expected_length) {
   int start = find_preamble(bits, nbits);
   if (start < 0) {
     return -1;
@@ -132,7 +147,11 @@ static int process_packet(const uint8_t *bits, int nbits, uint8_t *packet, int *
   //   "1010" -> 40-bit payload, "1001" -> 64-bit payload
   int b0 = bitarr_get(bits, start + 0), b1 = bitarr_get(bits, start + 1);
   int b2 = bitarr_get(bits, start + 2), b3 = bitarr_get(bits, start + 3);
-  if (!((b0 == 1 && b1 == 0 && b2 == 1 && b3 == 0) || (b0 == 1 && b1 == 0 && b2 == 0 && b3 == 1))) {
+  if (b0 == 1 && b1 == 0 && b2 == 1 && b3 == 0) {
+    *expected_length = 40;
+  } else if (b0 == 1 && b1 == 0 && b2 == 0 && b3 == 1) {
+    *expected_length = 64;
+  } else {
     return -2;
   }
 
@@ -368,62 +387,15 @@ void SecplusReceiverComponent::decode_raw_(const int32_t *pulses, int n_pulses) 
     int dur = (p < 0) ? -p : p;
     int lvl = (p > 0) ? 1 : 0;
 
-
     bool flush = (this->manchester_pos_ >= MAX_MANCHESTER - 4);
 
-    // ── Gap or buffer-full: attempt decode ──
+    // ── Gap or buffer-full: the frame is over ──
     if (dur >= LONG_THRESH || flush) {
       if (flush) {
         ESP_LOGW(TAG, "Manchester buffer full (%d bits), flushing. Could mean a noisy radio, try another frequency",
                  this->manchester_pos_);
       }
-
-      if (this->manchester_pos_ < MAX_MANCHESTER) {
-        bitarr_set(this->manchester_, this->manchester_pos_++, lvl);
-      }
-
-      bool is_packet_1 = (this->packet1_len_ == 0);
-
-
-
-      int frame_id = is_packet_1
-                         ? process_packet(this->manchester_, this->manchester_pos_, this->packet1_, &this->packet1_len_)
-                         : process_packet(this->manchester_, this->manchester_pos_, this->packet2_, &this->packet2_len_);
-
-      if (frame_id > 0) {
-        ESP_LOGD(TAG, "frame #%d decoded (%d bits)", frame_id,
-                 frame_id == 1 ? this->packet1_len_ : this->packet2_len_);
-      }
-
-      // Print out the raw Manchester for VERBOSE logging
-      ESP_LOGV(TAG, "%s", this->get_bits_string().c_str());
-
-      // Reject out-of-order frame 2 arriving before frame 1.
-      if (is_packet_1 && frame_id == 2) {
-        ESP_LOGW(TAG, "got frame 2 before frame 1, discarding");
-        this->packet2_len_ = 0;
-        frame_id = -1;
-      }
-
-      // Both frames received: run decode_v2 and publish.
-      if (frame_id == 2) {
-        uint8_t frame_type = (this->packet1_len_ == 40) ? 0 : 1;
-
-        uint32_t rolling = 0;
-        uint64_t fixed = 0;
-        uint32_t data = 0;
-
-        int ret = decode_v2(frame_type, this->packet1_, this->packet2_, &rolling, &fixed, &data);
-        if (ret < 0) {
-          ESP_LOGE(TAG, "secplus decode_v2 failed and returned: %d", ret);
-        } else {
-          this->publish_(rolling, fixed, data, frame_type);
-        }
-
-        this->packet1_len_ = this->packet2_len_ = 0;
-      }
-
-      this->manchester_pos_ = 0;
+      this->end_frame_(lvl);
       continue;
     }
 
@@ -439,6 +411,96 @@ void SecplusReceiverComponent::decode_raw_(const int32_t *pulses, int n_pulses) 
       bitarr_set(this->manchester_, this->manchester_pos_++, lvl);
     }
   }
+
+  // The end of a receive burst ends the frame too: either the radio went
+  // quiet, or the receiver cut the burst and dropped what followed. Nothing
+  // is carried into the next burst, where it would be joined to unrelated
+  // pulses.
+  if (this->manchester_pos_ > 0) {
+    this->end_frame_(0);
+  }
+}
+
+void SecplusReceiverComponent::end_frame_(int gap_level) {
+  if (this->manchester_pos_ < MAX_MANCHESTER) {
+    bitarr_set(this->manchester_, this->manchester_pos_++, gap_level);
+  }
+
+  // Decode into a zeroed scratch buffer, so a short frame can never be
+  // completed with bits left over from an earlier one.
+  uint8_t frame[MAX_DECODED_BYTES] = {0};
+  int frame_bits = 0;
+  int expected_bits = 0;
+  int frame_id = process_packet(this->manchester_, this->manchester_pos_, frame, &frame_bits, &expected_bits);
+
+  // Print out the raw Manchester for VERBOSE logging
+  ESP_LOGV(TAG, "%s", this->get_bits_string().c_str());
+  this->manchester_pos_ = 0;
+
+  if (frame_id == -1) {
+    return;  // no preamble: noise between frames, keep waiting
+  }
+  if (frame_id < 0 || frame_bits != expected_bits) {
+    if (frame_id > 0) {
+      ESP_LOGD(TAG, "frame #%d incomplete (%d of %d bits), discarding", frame_id, frame_bits, expected_bits);
+    }
+    this->frame1_bits_ = 0;  // whatever was pending is not followed by its frame 2
+    return;
+  }
+  ESP_LOGD(TAG, "frame #%d decoded (%d bits)", frame_id, frame_bits);
+
+  if (frame_id == 1) {
+    memcpy(this->frame1_, frame, sizeof(this->frame1_));
+    this->frame1_bits_ = frame_bits;
+    this->frame1_ms_ = millis();
+    return;
+  }
+
+  // Frame 2: usable only straight after a complete frame 1 of the same size.
+  const bool have_frame1 = this->frame1_bits_ != 0;
+  const bool fresh = have_frame1 && (millis() - this->frame1_ms_) <= PAIR_TIMEOUT_MS;
+  const bool same_size = this->frame1_bits_ == frame_bits;
+  this->frame1_bits_ = 0;  // a frame 1 is used once, whatever happens next
+  if (!have_frame1) {
+    ESP_LOGD(TAG, "got frame 2 without frame 1, discarding");
+    return;
+  }
+  if (!fresh || !same_size) {
+    ESP_LOGD(TAG, "frame 2 does not belong to the stored frame 1 (%s), discarding",
+             fresh ? "different size" : "too old");
+    return;
+  }
+
+  uint8_t frame_type = (frame_bits == 40) ? 0 : 1;
+  uint32_t rolling = 0;
+  uint64_t fixed = 0;
+  uint32_t payload = 0;
+
+  int ret = decode_v2(frame_type, this->frame1_, frame, &rolling, &fixed, &payload);
+  if (ret < 0) {
+    ESP_LOGE(TAG, "secplus decode_v2 failed and returned: %d", ret);
+    return;
+  }
+
+  if (this->require_repeat_) {
+    // decode_v2 has little validation, so a corrupted pair can decode to a
+    // plausible wrong code. Act only on a code seen in two packets in a row.
+    const uint32_t now = millis();
+    const bool repeated = this->pending_valid_ && this->pending_fixed_ == fixed &&
+                          this->pending_rolling_ == rolling && this->pending_data_ == payload &&
+                          (now - this->pending_ms_) <= REPEAT_WINDOW_MS;
+    this->pending_valid_ = true;
+    this->pending_fixed_ = fixed;
+    this->pending_rolling_ = rolling;
+    this->pending_data_ = payload;
+    this->pending_ms_ = now;
+    if (!repeated) {
+      ESP_LOGD(TAG, "fixed=%" PRIu64 " rolling=%u decoded once, waiting for a repeat", fixed, (unsigned) rolling);
+      return;
+    }
+  }
+
+  this->publish_(rolling, fixed, payload, frame_type);
 }
 
 void SecplusReceiverComponent::publish_(uint32_t rolling, uint64_t fixed, uint32_t data, uint8_t frame_type) {

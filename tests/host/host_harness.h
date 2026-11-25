@@ -18,6 +18,7 @@
 #ifdef USE_HOST
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "esphome/components/remote_base/remote_base.h"
@@ -67,8 +68,10 @@ inline void push_packet(std::vector<uint8_t> &levels, int frame_id, const uint8_
 }
 
 // Convert half-bit levels into signed pulse durations (positive = high,
-// negative = low) followed by a long low gap.
-inline void push_timings(esphome::remote_base::RawTimings &raw, const std::vector<uint8_t> &levels) {
+// negative = low) followed by a long low gap. With gap = false the pulses
+// simply stop, as they do when a receive burst ends.
+inline void push_timings(esphome::remote_base::RawTimings &raw, const std::vector<uint8_t> &levels,
+                         bool gap = true) {
   size_t i = 0;
   while (i < levels.size()) {
     size_t run = 1;
@@ -78,6 +81,13 @@ inline void push_timings(esphome::remote_base::RawTimings &raw, const std::vecto
     int32_t dur = (int32_t) run * HALF_BIT_US;
     raw.push_back(levels[i] ? dur : -dur);
     i += run;
+  }
+  if (!gap) {
+    // The receiver never reports the trailing low: it is part of the silence.
+    if (!raw.empty() && raw.back() < 0) {
+      raw.pop_back();
+    }
+    return;
   }
   if (!raw.empty() && raw.back() < 0) {
     raw.back() -= GAP_US;
@@ -116,6 +126,45 @@ inline void secplus_test_press(esphome::secplus_receiver::SecplusReceiverCompone
     secplus_test::push_timings(raw, levels);
   }
 
+  rx->on_receive(esphome::remote_base::RemoteReceiveData(raw, 25, esphome::remote_base::TOLERANCE_MODE_PERCENTAGE));
+}
+
+// Inject hand-picked frames of one transmission as a single receive burst,
+// to exercise the decoder's frame pairing. `frames` is a sequence of:
+//   '1'  frame 1            '2'  frame 2
+//   't'  frame 2 cut short (20 of its 40 payload bits)
+//   'x'  (last character only) end the burst with no trailing gap
+inline void secplus_test_inject(esphome::secplus_receiver::SecplusReceiverComponent *rx, uint64_t fixed,
+                                uint32_t rolling, const std::string &frames) {
+  uint8_t packet1[8] = {0};
+  uint8_t packet2[8] = {0};
+  if (encode_v2(rolling, fixed, 0, 0, packet1, packet2) < 0) {
+    ESP_LOGE("secplus_test", "encode_v2 failed for fixed=%llu rolling=%u", (unsigned long long) fixed,
+             (unsigned) rolling);
+    return;
+  }
+  const bool no_gap = !frames.empty() && frames.back() == 'x';
+  const size_t count = no_gap ? frames.size() - 1 : frames.size();
+
+  esphome::remote_base::RawTimings raw;
+  for (size_t i = 0; i < count; i++) {
+    std::vector<uint8_t> levels;
+    switch (frames[i]) {
+      case '1':
+        secplus_test::push_packet(levels, 0, packet1, 40);
+        break;
+      case '2':
+        secplus_test::push_packet(levels, 1, packet2, 40);
+        break;
+      case 't':
+        secplus_test::push_packet(levels, 1, packet2, 20);
+        break;
+      default:
+        ESP_LOGE("secplus_test", "unknown frame token '%c'", frames[i]);
+        return;
+    }
+    secplus_test::push_timings(raw, levels, !(no_gap && i + 1 == count));
+  }
   rx->on_receive(esphome::remote_base::RemoteReceiveData(raw, 25, esphome::remote_base::TOLERANCE_MODE_PERCENTAGE));
 }
 

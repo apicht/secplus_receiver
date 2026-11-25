@@ -58,6 +58,11 @@ Optional authentication (allowlist + rolling-counter replay protection):
         on_press:
           - secplus_receiver.learn: receiver
 
+A corrupted reception can decode to a plausible wrong code, so with
+authentication a code is acted on only after two packets in a row decode to
+it (a remote repeats its packet while the button is held). Set
+`require_repeat: true` / `false` to choose this explicitly.
+
 Actions: secplus_receiver.learn, secplus_receiver.stop_learn,
 secplus_receiver.forget (slot: N), secplus_receiver.forget_all.
 
@@ -71,6 +76,7 @@ import esphome.codegen as cg
 from esphome import automation
 from esphome.components import remote_base, remote_receiver, text_sensor
 import esphome.config_validation as cv
+import esphome.final_validate as fv
 from esphome.const import CONF_ID, CONF_NAME, CONF_TRIGGER_ID, ENTITY_CATEGORY_DIAGNOSTIC
 
 _LOGGER = logging.getLogger(__name__)
@@ -94,6 +100,7 @@ CONF_ROLLING_CODE_SENSOR = "rolling_code_sensor"
 CONF_REMOTE_ID_SENSOR = "remote_id_sensor"
 CONF_BUTTON_SENSOR = "button_sensor"
 CONF_FIRE_EVENT = "fire_homeassistant_event"
+CONF_REQUIRE_REPEAT = "require_repeat"
 CONF_ON_REMOTE_RECEIVED = "on_remote_received"
 CONF_ON_AUTHENTICATED = "on_authenticated"
 CONF_ON_REJECTED = "on_rejected"
@@ -220,6 +227,10 @@ CONFIG_SCHEMA = cv.All(
 
         cv.Optional(CONF_FIRE_EVENT, default=False): cv.boolean,
 
+        # Act on a code only after two packets in a row decode to it. When
+        # omitted it is on if authentication is configured, otherwise off.
+        cv.Optional(CONF_REQUIRE_REPEAT): cv.boolean,
+
         cv.Optional(CONF_ON_REMOTE_RECEIVED): automation.validate_automation(
             {
                 cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(RemoteReceivedTrigger),
@@ -249,6 +260,45 @@ CONFIG_SCHEMA = cv.All(
     ).extend(cv.COMPONENT_SCHEMA),
     _validate_triggers_need_authentication,
 )
+
+# On ESP32 remote_receiver cuts a burst at `receive_symbols` symbols (two
+# pulses each). A press sends its packet several times in one burst, and two
+# whole packets can take 250 symbols, so a smaller limit leaves only one
+# complete packet and require_repeat would never see its repeat.
+CONF_RECEIVE_SYMBOLS = "receive_symbols"
+MIN_RECEIVE_SYMBOLS = 256
+
+
+def _require_repeat(config: dict) -> bool:
+    return config.get(CONF_REQUIRE_REPEAT, CONF_AUTHENTICATION in config)
+
+
+def _final_validate(config: dict) -> dict:
+    if not _require_repeat(config):
+        return config
+    full = fv.full_config.get()
+    try:
+        path = full.get_path_for_id(config[remote_base.CONF_RECEIVER_ID])[:-1]
+        receiver = full.get_config_for_path(path)
+    except KeyError:
+        return config
+    symbols = receiver.get(CONF_RECEIVE_SYMBOLS)  # only present on ESP32
+    if symbols is not None and symbols < MIN_RECEIVE_SYMBOLS:
+        reason = (
+            f"'{CONF_AUTHENTICATION}' turns on '{CONF_REQUIRE_REPEAT}'"
+            if CONF_REQUIRE_REPEAT not in config
+            else f"'{CONF_REQUIRE_REPEAT}' is on"
+        )
+        raise cv.Invalid(
+            f"{reason}, which needs two whole packets from one press, but "
+            f"remote_receiver stops a burst after {symbols} symbols and that holds "
+            f"only one. Set '{CONF_RECEIVE_SYMBOLS}: 512' under 'remote_receiver:' "
+            f"(minimum {MIN_RECEIVE_SYMBOLS}), or set '{CONF_REQUIRE_REPEAT}: false'."
+        )
+    return config
+
+
+FINAL_VALIDATE_SCHEMA = _final_validate
 
 _PARENT_ACTION_SCHEMA = automation.maybe_simple_id(
     {
@@ -338,6 +388,9 @@ async def to_code(config: dict) -> None:
 
     if config.get(CONF_FIRE_EVENT):
         cg.add(var.set_fire_event(True))
+
+    if _require_repeat(config):
+        cg.add(var.set_require_repeat(True))
 
     if auth_config := config.get(CONF_AUTHENTICATION):
         cg.add(

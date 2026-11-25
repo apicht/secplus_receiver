@@ -35,6 +35,7 @@ PORT = 16053  # must match api.port in secplus_host.yaml
 TIMEOUT = 5.0
 LEARN_TIMEOUT = 2.0  # must match learn_timeout in secplus_host.yaml
 WINDOW = 16  # must match window in secplus_host.yaml
+REPEAT_WINDOW = 1.5  # must match REPEAT_WINDOW_MS in secplus_receiver.cpp
 
 REMOTE_A = 70678577664
 REMOTE_B = 62088643072
@@ -151,6 +152,24 @@ class Device:
 
         return await self.wait_for(find, f"event for fixed={fixed} rolling={rolling}")
 
+    async def inject(self, fixed: int, rolling: int, frames: str) -> None:
+        """Feed chosen frames of one transmission as a single burst (see host_harness.h)."""
+        await self.client.execute_service(
+            self.services["inject"], {"fixed": str(fixed), "rolling": rolling, "frames": frames}
+        )
+
+    async def set_require_repeat(self, enabled: bool) -> None:
+        await self.client.execute_service(self.services["set_require_repeat"], {"enabled": enabled})
+
+    async def decoded_since(self, start: int) -> list[tuple[int, int]]:
+        """(fixed, rolling) of every code published since event index `start`."""
+        await asyncio.sleep(0.3)  # let anything unexpected arrive too
+        return [
+            (int(e.data["fixed_data"]), int(e.data["rolling_code"]))
+            for e in self.events[start:]
+            if e.service == "esphome.secplus_received"
+        ]
+
     def learned_events(self) -> list[dict[str, str]]:
         return [e.data for e in self.events if e.service == "esphome.secplus_remote_learned"]
 
@@ -207,6 +226,79 @@ async def test_decode_and_unknown_remote(dev: Device) -> None:
     await dev.wait_for(
         lambda: dev.states.get(dev.keys["Rolling Code"]) == "100", "Rolling Code sensor"
     )
+
+
+# Decoder frame pairing. A packet is two frames; these feed awkward
+# combinations and check that nothing but the genuine code is published.
+DECODER_REMOTE = 900001
+PAIR_TIMEOUT = 0.3  # must exceed PAIR_TIMEOUT_MS in secplus_receiver.cpp
+
+
+async def test_decoder_ignores_stale_frame(dev: Device) -> None:
+    await dev.set_require_repeat(False)  # observe single packets
+    start = len(dev.events)
+    await dev.inject(DECODER_REMOTE, 1000, "1")  # frame 2 never arrives
+    await asyncio.sleep(PAIR_TIMEOUT + 0.2)
+    await dev.inject(DECODER_REMOTE, 1001, "12")
+    assert await dev.decoded_since(start) == [(DECODER_REMOTE, 1001)]
+
+
+async def test_decoder_handles_frame_2_first(dev: Device) -> None:
+    start = len(dev.events)
+    await dev.inject(DECODER_REMOTE, 1010, "212")  # burst starts mid-packet
+    assert await dev.decoded_since(start) == [(DECODER_REMOTE, 1010)]
+
+
+async def test_decoder_rejects_truncated_frame(dev: Device) -> None:
+    start = len(dev.events)
+    await dev.inject(DECODER_REMOTE, 1020, "12")
+    await dev.inject(DECODER_REMOTE, 1021, "1t")  # frame 2 cut short
+    assert await dev.decoded_since(start) == [(DECODER_REMOTE, 1020)]
+    await dev.inject(DECODER_REMOTE, 1021, "12")
+    assert await dev.decoded_since(start) == [(DECODER_REMOTE, 1020), (DECODER_REMOTE, 1021)]
+
+
+async def test_decoder_pairs_frames_only_within_timeout(dev: Device) -> None:
+    start = len(dev.events)
+    await dev.inject(DECODER_REMOTE, 1030, "1")
+    await asyncio.sleep(PAIR_TIMEOUT + 0.2)
+    await dev.inject(DECODER_REMOTE, 1030, "2")
+    assert await dev.decoded_since(start) == []
+    await dev.inject(DECODER_REMOTE, 1031, "1")  # split over two bursts, close together
+    await dev.inject(DECODER_REMOTE, 1031, "2")
+    assert await dev.decoded_since(start) == [(DECODER_REMOTE, 1031)]
+
+
+async def test_decoder_decodes_frame_at_end_of_burst(dev: Device) -> None:
+    start = len(dev.events)
+    await dev.inject(DECODER_REMOTE, 1040, "12x")  # no gap after the last frame
+    assert await dev.decoded_since(start) == [(DECODER_REMOTE, 1040)]
+    await dev.set_require_repeat(True)
+
+
+async def test_require_repeat(dev: Device) -> None:
+    start = len(dev.events)
+    await dev.inject(DECODER_REMOTE, 1050, "12")  # one packet is not enough
+    await dev.inject(DECODER_REMOTE, 1051, "12")  # a different code does not confirm it
+    assert await dev.decoded_since(start) == []
+    assert not [e for e in dev.events[start:] if e.service.startswith("esphome.test_")]
+    await dev.inject(DECODER_REMOTE, 1051, "12")  # same code again, in a later burst
+    assert await dev.decoded_since(start) == [(DECODER_REMOTE, 1051)]
+    await dev.inject(DECODER_REMOTE, 1052, "12")
+    await asyncio.sleep(REPEAT_WINDOW + 0.3)
+    await dev.inject(DECODER_REMOTE, 1052, "12")  # too late to count as a repeat
+    assert await dev.decoded_since(start) == [(DECODER_REMOTE, 1051)]
+
+
+async def test_single_packet_does_not_advance_counter(dev: Device) -> None:
+    # REMOTE_A is enrolled and 121 is its next valid code. A lone packet (which
+    # could be a corrupted decode) must not authenticate or move the counter:
+    # test_stop_learn_closes_learn_mode later authenticates 121 itself.
+    start = len(dev.events)
+    await dev.inject(REMOTE_A, 121, "12")
+    assert await dev.decoded_since(start) == []
+    assert not [e for e in dev.events[start:] if e.service.startswith("esphome.test_")]
+    await asyncio.sleep(REPEAT_WINDOW + 0.3)  # so the later press starts afresh
 
 
 async def test_learn_needs_two_presses(dev: Device) -> None:
@@ -427,9 +519,16 @@ async def test_learned_copy_of_static_remote_is_merged_at_boot(dev: Device) -> N
 SCENARIOS = [
     test_boot_state,
     test_decode_and_unknown_remote,
+    test_decoder_ignores_stale_frame,
+    test_decoder_handles_frame_2_first,
+    test_decoder_rejects_truncated_frame,
+    test_decoder_pairs_frames_only_within_timeout,
+    test_decoder_decodes_frame_at_end_of_burst,
+    test_require_repeat,
     test_learn_needs_two_presses,
     test_authenticates_and_rejects_replay,
     test_counter_window,
+    test_single_packet_does_not_advance_counter,
     test_static_remote,
     test_static_remote_recovers_from_lockout,
     test_keypad_frame,

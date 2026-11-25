@@ -42,6 +42,8 @@ class SecplusReceiverComponent
   void set_remote_id_sensor(text_sensor::TextSensor *sensor) { this->remote_id_sensor_ = sensor; }
   void set_button_sensor(text_sensor::TextSensor *sensor) { this->button_sensor_ = sensor; }
   void set_fire_event(bool fire) { this->fire_event_ = fire; }
+  // Only act on a code after it has been decoded from two packets in a row.
+  void set_require_repeat(bool require) { this->require_repeat_ = require; }
 
   // ── Authentication (optional) ──────────────────────────────────────────────
   // Enables the enrolled-remote table with `learn_slots` learnable slots.
@@ -95,11 +97,15 @@ class SecplusReceiverComponent
   // Feed a burst of signed pulse durations (us) through the Manchester decoder.
   // Negative = signal LOW (space), positive = signal HIGH (mark).
   void decode_raw_(const int32_t *pulses, int n_pulses);
+  // Close the frame in the Manchester buffer (the gap after it was at
+  // `gap_level`), pair it with its other half and decode.
+  void end_frame_(int gap_level);
 
   // Fire the sensors / log line once a Security+ v2 packet pair is decoded.
   void publish_(uint32_t rolling, uint64_t fixed, uint32_t data, uint8_t frame_type);
 
   bool fire_event_{false};
+  bool require_repeat_{false};
 
   // To prevent/limit duplicates
   uint64_t last_fixed{0};
@@ -132,14 +138,20 @@ class SecplusReceiverComponent
 
 
   // ── Manchester decoder state ───────────────────────────────────────────────
-  // Retained across on_receive() calls so the two Security+ frames can be
-  // accumulated even when they arrive in separate receive bursts.
+  // Half-bit levels of the frame being received. Cleared at every gap and at
+  // the end of every receive burst.
   uint8_t manchester_[64]{};  // MANCHESTER_BYTES
   int manchester_pos_{0};
-  uint8_t packet1_[32]{};  // MAX_DECODED_BYTES
-  int packet1_len_{0};
-  uint8_t packet2_[32]{};
-  int packet2_len_{0};
+  // The last complete frame 1, waiting for its frame 2. 0 bits = none.
+  uint8_t frame1_[32]{};  // MAX_DECODED_BYTES
+  int frame1_bits_{0};
+  uint32_t frame1_ms_{0};
+  // The last decoded code, waiting for a repeat (require_repeat).
+  bool pending_valid_{false};
+  uint64_t pending_fixed_{0};
+  uint32_t pending_rolling_{0};
+  uint32_t pending_data_{0};
+  uint32_t pending_ms_{0};
 
   text_sensor::TextSensor *fixed_data_sensor_{nullptr};
   text_sensor::TextSensor *rolling_code_sensor_{nullptr};
